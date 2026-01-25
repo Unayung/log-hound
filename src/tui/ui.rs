@@ -23,6 +23,98 @@ const LOG_GROUP_COLORS: &[Color] = &[
     Color::LightBlue,
 ];
 
+/// Strip ANSI escape codes from a string
+/// Log messages from CloudWatch may contain ANSI codes that interfere with TUI rendering
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC and the following sequence
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // Skip until we hit a letter (the command character)
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Highlight search patterns in a message, returning styled spans with owned strings
+/// Matches are highlighted in red, non-matches in gray
+fn highlight_patterns(message: &str, patterns: &[String]) -> Vec<Span<'static>> {
+    if patterns.is_empty() || message.is_empty() {
+        return vec![Span::styled(message.to_string(), Style::default().fg(Color::Gray))];
+    }
+
+    let highlight_style = Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::Gray);
+
+    // Find all match positions (start, end) for all patterns
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    let message_lower = message.to_lowercase();
+
+    for pattern in patterns {
+        if pattern.is_empty() {
+            continue;
+        }
+        let pattern_lower = pattern.to_lowercase();
+        let mut start = 0;
+        while let Some(pos) = message_lower[start..].find(&pattern_lower) {
+            let abs_pos = start + pos;
+            matches.push((abs_pos, abs_pos + pattern.len()));
+            start = abs_pos + 1;
+        }
+    }
+
+    if matches.is_empty() {
+        return vec![Span::styled(message.to_string(), normal_style)];
+    }
+
+    // Sort matches by start position and merge overlapping ones
+    matches.sort_by_key(|m| m.0);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in matches {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    // Build spans with owned strings
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut pos = 0;
+
+    for (start, end) in merged {
+        // Add non-matching text before this match
+        if pos < start {
+            spans.push(Span::styled(message[pos..start].to_string(), normal_style));
+        }
+        // Add the highlighted match
+        spans.push(Span::styled(message[start..end].to_string(), highlight_style));
+        pos = end;
+    }
+
+    // Add remaining non-matching text
+    if pos < message.len() {
+        spans.push(Span::styled(message[pos..].to_string(), normal_style));
+    }
+
+    spans
+}
+
 /// Shorten region name: ap-northeast-1 -> AN1, ap-east-2 -> AE2, us-west-1 -> UW1, etc.
 fn shorten_region(region: &str) -> String {
     let parts: Vec<&str> = region.split('-').collect();
@@ -257,7 +349,18 @@ fn render_log_groups(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let selected_count = app.selected_log_groups_count();
-    let title = format!(" Log Groups ({} selected) ", selected_count);
+    let filtered_indices = app.filtered_log_groups_indices();
+    let filter_info = if app.log_groups_filter.is_empty() {
+        String::new()
+    } else {
+        format!(" [filter: {}]", app.log_groups_filter)
+    };
+    let title = format!(
+        " Log Groups ({} selected, {} shown){} ",
+        selected_count,
+        filtered_indices.len(),
+        filter_info
+    );
 
     let block = Block::default()
         .title(title)
@@ -275,22 +378,34 @@ fn render_log_groups(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(Color::Gray))
             .wrap(Wrap { trim: true });
         f.render_widget(paragraph, area);
+    } else if filtered_indices.is_empty() {
+        let msg = format!("No groups match filter: {}", app.log_groups_filter);
+        let paragraph = Paragraph::new(msg)
+            .block(block)
+            .style(Style::default().fg(Color::Gray))
+            .wrap(Wrap { trim: true });
+        f.render_widget(paragraph, area);
     } else {
         let visible_height = area.height.saturating_sub(2) as usize;
 
-        let scroll_offset = if app.log_groups_cursor >= visible_height {
-            app.log_groups_cursor - visible_height + 1
+        // Find position in filtered list for scroll
+        let cursor_pos_in_filtered = filtered_indices
+            .iter()
+            .position(|&i| i == app.log_groups_cursor)
+            .unwrap_or(0);
+
+        let scroll_offset = if cursor_pos_in_filtered >= visible_height {
+            cursor_pos_in_filtered - visible_height + 1
         } else {
             0
         };
 
-        let items: Vec<ListItem> = app
-            .log_groups
+        let items: Vec<ListItem> = filtered_indices
             .iter()
-            .enumerate()
             .skip(scroll_offset)
             .take(visible_height)
-            .map(|(idx, item)| {
+            .map(|&idx| {
+                let item = &app.log_groups[idx];
                 let checkbox = if item.selected { "[x]" } else { "[ ]" };
                 let is_cursor = idx == app.log_groups_cursor;
 
@@ -477,7 +592,8 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
             .skip(app.results_scroll)
             .take(area.height.saturating_sub(2) as usize)
             .map(|(idx, entry)| {
-                let is_selected = app.selected_result == Some(idx);
+                // Removed row highlighting - was causing inconsistent display when scrolling
+                let is_selected = false;
                 let timestamp = entry.timestamp.format("%H:%M:%S%.3f").to_string();
 
                 let region_short = entry
@@ -503,48 +619,45 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
                     Style::default()
                 };
 
+                // Strip ANSI escape codes from message to prevent color/display corruption
+                let clean_message = strip_ansi_codes(&entry.message);
+
+                // Get search patterns for highlighting
+                let patterns = app.get_patterns();
+
                 let line = if app.horizontal_scroll == 0 {
-                    // No horizontal scroll - show full formatted line
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{} ", timestamp),
-                            base_style.fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            format!("[{}] ", region_short),
-                            base_style.fg(group_color).add_modifier(Modifier::DIM),
-                        ),
-                        Span::styled(
-                            format!("[{}] ", group_short),
-                            base_style.fg(group_color),
-                        ),
-                        Span::styled(&entry.message, base_style),
-                    ])
+                    // No horizontal scroll - show full formatted line with highlighted search terms
+                    let mut spans: Vec<Span<'static>> = vec![
+                        Span::styled(format!("{} ", timestamp), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("[{}] ", region_short), Style::default().fg(group_color).add_modifier(Modifier::DIM)),
+                        Span::styled(format!("[{}] ", group_short), Style::default().fg(group_color)),
+                    ];
+                    // Add highlighted message spans
+                    spans.extend(highlight_patterns(&clean_message, &patterns));
+                    Line::from(spans)
                 } else {
-                    // Horizontal scroll - show line number + scrolled content with colors
+                    // Horizontal scroll - show line number + content with highlighting
                     let line_num = format!("{:02} ", (idx % 100));
                     let content_width = available_width.saturating_sub(line_num_width);
 
-                    // Build the scrolled content
+                    // Build full content string for scrolling
                     let full_content = format!(
-                        "[{}] [{}] {}",
-                        region_short, group_short, entry.message
+                        "{} [{}] [{}] {}",
+                        timestamp, region_short, group_short, clean_message
                     );
 
-                    let scrolled_content: String = if app.horizontal_scroll >= full_content.len() {
-                        String::new()
-                    } else {
-                        full_content
-                            .chars()
-                            .skip(app.horizontal_scroll)
-                            .take(content_width)
-                            .collect()
-                    };
+                    let scrolled_content: String = full_content
+                        .chars()
+                        .skip(app.horizontal_scroll)
+                        .take(content_width)
+                        .collect();
 
-                    Line::from(vec![
-                        Span::styled(line_num, base_style.fg(Color::DarkGray)),
-                        Span::styled(scrolled_content, base_style.fg(group_color)),
-                    ])
+                    // Build spans with line number + highlighted content
+                    let mut spans: Vec<Span<'static>> = vec![
+                        Span::styled(line_num, Style::default().fg(Color::DarkGray)),
+                    ];
+                    spans.extend(highlight_patterns(&scrolled_content, &patterns));
+                    Line::from(spans)
                 };
 
                 ListItem::new(line)
@@ -563,22 +676,24 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(" Toggle  "),
             Span::styled("↑/↓", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Navigate  "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Search  "),
             Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Next (loads groups)  "),
+            Span::raw(" Next  "),
             Span::styled("Ctrl+C", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Quit"),
         ]),
         Focus::LogGroups => Line::from(vec![
+            Span::styled("Type", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Filter  "),
             Span::styled("Space", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Toggle  "),
             Span::styled("↑/↓", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Navigate  "),
-            Span::styled("Ctrl+A", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" All  "),
-            Span::styled("Ctrl+D", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" None  "),
-            Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Next"),
+            Span::raw(" Nav  "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Search  "),
+            Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Clear"),
         ]),
         Focus::Results => Line::from(vec![
             Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),

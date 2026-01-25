@@ -2,7 +2,7 @@ use crate::aws::{LogEntry, MultiRegionSearcher};
 use crate::time::TimeRange;
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind, MouseButton},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -101,6 +101,7 @@ pub struct App {
     // Log group selection
     pub log_groups: Vec<LogGroupItem>,
     pub log_groups_cursor: usize,
+    pub log_groups_filter: String,
 
     // Track if we need to reload log groups
     pub regions_changed: bool,
@@ -136,6 +137,7 @@ impl App {
             regions_cursor: 0,
             log_groups: Vec::new(),
             log_groups_cursor: 0,
+            log_groups_filter: String::new(),
             regions_changed: true, // Load on first focus
             horizontal_scroll: 0,
             selected_result: None,
@@ -263,22 +265,63 @@ impl App {
         self.selected_result = None;
     }
 
-    // Log group navigation
+    // Log group filtering - fuzzy match on name
+    pub fn filtered_log_groups_indices(&self) -> Vec<usize> {
+        if self.log_groups_filter.is_empty() {
+            return (0..self.log_groups.len()).collect();
+        }
+        let filter_lower = self.log_groups_filter.to_lowercase();
+        self.log_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.name.to_lowercase().contains(&filter_lower))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    // Log group navigation (works with filtered list)
     pub fn log_groups_down(&mut self) {
-        if !self.log_groups.is_empty() && self.log_groups_cursor < self.log_groups.len() - 1 {
-            self.log_groups_cursor += 1;
+        let filtered = self.filtered_log_groups_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        // Find current position in filtered list
+        if let Some(pos) = filtered.iter().position(|&i| i == self.log_groups_cursor) {
+            if pos < filtered.len() - 1 {
+                self.log_groups_cursor = filtered[pos + 1];
+            }
+        } else {
+            // Cursor not in filtered list, jump to first filtered item
+            self.log_groups_cursor = filtered[0];
         }
     }
 
     pub fn log_groups_up(&mut self) {
-        if self.log_groups_cursor > 0 {
-            self.log_groups_cursor -= 1;
+        let filtered = self.filtered_log_groups_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        if let Some(pos) = filtered.iter().position(|&i| i == self.log_groups_cursor) {
+            if pos > 0 {
+                self.log_groups_cursor = filtered[pos - 1];
+            }
+        } else {
+            // Cursor not in filtered list, jump to first filtered item
+            self.log_groups_cursor = filtered[0];
         }
     }
 
     pub fn toggle_log_group(&mut self) {
         if let Some(item) = self.log_groups.get_mut(self.log_groups_cursor) {
             item.selected = !item.selected;
+        }
+    }
+
+    // Reset cursor to first filtered item when filter changes
+    pub fn reset_log_groups_cursor(&mut self) {
+        let filtered = self.filtered_log_groups_indices();
+        if !filtered.is_empty() {
+            self.log_groups_cursor = filtered[0];
         }
     }
 
@@ -329,9 +372,10 @@ impl App {
 
 pub async fn run_tui(searcher: MultiRegionSearcher) -> Result<()> {
     // Setup terminal
+    // Note: Mouse capture is disabled to allow native terminal text selection for copy/paste
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -341,11 +385,7 @@ pub async fn run_tui(searcher: MultiRegionSearcher) -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -400,11 +440,6 @@ async fn run_app(
         if event::poll(std::time::Duration::from_millis(100))? {
             let event = event::read()?;
 
-            // Handle mouse events
-            if let Event::Mouse(mouse) = event {
-                handle_mouse_event(app, mouse, terminal.size()?);
-            }
-
             if let Event::Key(key) = event {
                 // Global keybindings
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -445,70 +480,59 @@ async fn run_app(
                         app.prev_focus();
                     }
                     KeyCode::Enter => {
-                        match app.focus {
-                            Focus::Regions => {
-                                // Toggle region and reload
-                                app.toggle_region();
-                                load_log_groups(app, searcher).await;
-                            }
-                            Focus::LogGroups => {
-                                app.toggle_log_group();
-                            }
-                            Focus::Results => {}
-                            _ => {
-                                // Trigger search
-                                let patterns = app.get_patterns();
-                                let groups = app.get_selected_log_groups();
+                        // Enter triggers search from any section except Results
+                        if app.focus != Focus::Results {
+                            let patterns = app.get_patterns();
+                            let groups = app.get_selected_log_groups();
 
-                                if !patterns.is_empty() && !groups.is_empty() {
-                                    app.search_state = SearchState::Searching;
-                                    app.results.clear();
+                            if !patterns.is_empty() && !groups.is_empty() {
+                                app.search_state = SearchState::Searching;
+                                app.results.clear();
 
-                                    let time_range =
-                                        TimeRange::from_relative(app.time_range_value());
-                                    match time_range {
-                                        Ok(tr) => {
-                                            let results = searcher
-                                                .search_log_groups(
-                                                    &groups,
-                                                    &patterns,
-                                                    tr.start,
-                                                    tr.end,
-                                                    app.limit_value(),
-                                                )
-                                                .await;
+                                let time_range =
+                                    TimeRange::from_relative(app.time_range_value());
+                                match time_range {
+                                    Ok(tr) => {
+                                        let results = searcher
+                                            .search_log_groups(
+                                                &groups,
+                                                &patterns,
+                                                tr.start,
+                                                tr.end,
+                                                app.limit_value(),
+                                            )
+                                            .await;
 
-                                            let mut all_entries = Vec::new();
-                                            let mut errors = Vec::new();
+                                        let mut all_entries = Vec::new();
+                                        let mut errors = Vec::new();
 
-                                            for result in results {
-                                                match result {
-                                                    Ok(entries) => all_entries.extend(entries),
-                                                    Err(e) => errors.push(e.to_string()),
-                                                }
+                                        for result in results {
+                                            match result {
+                                                Ok(entries) => all_entries.extend(entries),
+                                                Err(e) => errors.push(e.to_string()),
                                             }
-
-                                            all_entries
-                                                .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-                                            let count = all_entries.len();
-                                            app.results = all_entries;
-                                            app.results_scroll = 0;
-
-                                            if errors.is_empty() {
-                                                app.search_state = SearchState::Complete(count);
-                                            } else if count > 0 {
-                                                app.search_state = SearchState::Complete(count);
-                                            } else {
-                                                app.search_state =
-                                                    SearchState::Error(errors.join("; "));
-                                            }
-
-                                            app.focus = Focus::Results;
                                         }
-                                        Err(e) => {
-                                            app.search_state = SearchState::Error(e.to_string());
+
+                                        all_entries
+                                            .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+                                        let count = all_entries.len();
+                                        app.results = all_entries;
+                                        app.results_scroll = 0;
+
+                                        if errors.is_empty() {
+                                            app.search_state = SearchState::Complete(count);
+                                        } else if count > 0 {
+                                            app.search_state = SearchState::Complete(count);
+                                        } else {
+                                            app.search_state =
+                                                SearchState::Error(errors.join("; "));
                                         }
+
+                                        app.focus = Focus::Results;
+                                    }
+                                    Err(e) => {
+                                        app.search_state = SearchState::Error(e.to_string());
                                     }
                                 }
                             }
@@ -518,7 +542,7 @@ async fn run_app(
                         match app.focus {
                             Focus::Regions => {
                                 app.toggle_region();
-                                // Don't reload immediately - wait for Tab or Enter
+                                // Don't reload immediately - wait for Tab
                             }
                             Focus::LogGroups => {
                                 app.toggle_log_group();
@@ -529,6 +553,10 @@ async fn run_app(
                     KeyCode::Esc => {
                         if app.focus == Focus::Results {
                             app.focus = Focus::Patterns;
+                        } else if app.focus == Focus::LogGroups && !app.log_groups_filter.is_empty() {
+                            // Clear filter with Esc
+                            app.log_groups_filter.clear();
+                            app.reset_log_groups_cursor();
                         }
                     }
                     _ => {
@@ -543,8 +571,17 @@ async fn run_app(
                                 _ => {}
                             },
                             Focus::LogGroups => match key.code {
-                                KeyCode::Up | KeyCode::Char('k') => app.log_groups_up(),
-                                KeyCode::Down | KeyCode::Char('j') => app.log_groups_down(),
+                                KeyCode::Up => app.log_groups_up(),
+                                KeyCode::Down => app.log_groups_down(),
+                                KeyCode::Char(c) => {
+                                    // Type to filter
+                                    app.log_groups_filter.push(c);
+                                    app.reset_log_groups_cursor();
+                                }
+                                KeyCode::Backspace => {
+                                    app.log_groups_filter.pop();
+                                    app.reset_log_groups_cursor();
+                                }
                                 _ => {}
                             },
                             Focus::TimeRange => match key.code {
@@ -595,42 +632,3 @@ fn handle_text_input(key: KeyCode, input: &mut String) {
     }
 }
 
-fn handle_mouse_event(app: &mut App, mouse: MouseEvent, size: ratatui::layout::Size) {
-    // Calculate results area based on layout (same as render function)
-    let selection_height: u16 = if app.focus == Focus::Regions || app.focus == Focus::LogGroups {
-        10
-    } else {
-        3
-    };
-
-    // Layout: margin(1), then patterns(3), selection(variable), time_status(3), results(min 8), help(2)
-    let results_top = 1 + 3 + selection_height + 3; // margin + patterns + selection + time_status
-    let results_bottom = (size.height as u16).saturating_sub(1 + 2); // minus margin and help
-    let results_left: u16 = 1; // margin
-    let results_right = (size.width as u16).saturating_sub(1); // minus margin
-
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            let x = mouse.column;
-            let y = mouse.row;
-
-            // Check if click is within results area (accounting for border)
-            if y > results_top && y < results_bottom && x > results_left && x < results_right {
-                let row_in_results = (y - results_top - 1) as usize; // -1 for top border
-                app.select_result_at_row(row_in_results);
-                app.focus = Focus::Results;
-            }
-        }
-        MouseEventKind::ScrollUp => {
-            if app.focus == Focus::Results {
-                app.scroll_results_up();
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            if app.focus == Focus::Results {
-                app.scroll_results_down();
-            }
-        }
-        _ => {}
-    }
-}
