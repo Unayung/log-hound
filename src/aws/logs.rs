@@ -11,8 +11,24 @@ pub struct LogEntry {
     pub timestamp: DateTime<Utc>,
     pub message: String,
     pub log_group: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub log_stream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+}
+
+/// Search parameters including patterns and exclusions
+#[derive(Debug, Clone, Default)]
+pub struct SearchParams {
+    pub patterns: Vec<String>,
+    pub exclude: Vec<String>,
+    pub limit: i32,
+}
+
+impl SearchParams {
+    pub fn new(patterns: Vec<String>, exclude: Vec<String>, limit: i32) -> Self {
+        Self { patterns, exclude, limit }
+    }
 }
 
 pub struct LogSearcher {
@@ -59,16 +75,15 @@ impl LogSearcher {
         Ok(log_groups)
     }
 
-    /// Search a single log group with the given patterns (AND condition)
+    /// Search a single log group with the given patterns (AND condition) and exclusions
     pub async fn search_log_group(
         &self,
         log_group: &str,
-        patterns: &[String],
+        params: &SearchParams,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-        limit: i32,
     ) -> Result<Vec<LogEntry>> {
-        let query = build_insights_query(patterns, limit);
+        let query = build_insights_query(&params.patterns, &params.exclude, params.limit);
 
         if std::env::var("LOG_HOUND_DEBUG").is_ok() {
             eprintln!("DEBUG: Log group: {}", log_group);
@@ -145,17 +160,28 @@ impl LogSearcher {
     }
 }
 
-/// Build CloudWatch Insights query for message filtering (multiple patterns = AND)
-fn build_insights_query(patterns: &[String], limit: i32) -> String {
-    let filter_conditions: Vec<String> = patterns
-        .iter()
-        .map(|p| {
-            let escaped = p.replace('\'', "\\'");
-            format!("@message like /{}/", escaped)
-        })
-        .collect();
+/// Build CloudWatch Insights query for message filtering
+/// Supports include patterns (AND) and exclude patterns (NOT)
+fn build_insights_query(patterns: &[String], exclude: &[String], limit: i32) -> String {
+    let mut filter_conditions: Vec<String> = Vec::new();
 
-    let filter_clause = filter_conditions.join(" and ");
+    // Add include patterns (AND condition)
+    for p in patterns {
+        let escaped = p.replace('\'', "\\'");
+        filter_conditions.push(format!("@message like /{}/", escaped));
+    }
+
+    // Add exclude patterns (NOT condition)
+    for p in exclude {
+        let escaped = p.replace('\'', "\\'");
+        filter_conditions.push(format!("@message not like /{}/", escaped));
+    }
+
+    let filter_clause = if filter_conditions.is_empty() {
+        "1=1".to_string() // No filter, match all
+    } else {
+        filter_conditions.join(" and ")
+    };
 
     format!(
         r#"fields @timestamp, @message, @logStream
@@ -241,10 +267,9 @@ impl MultiRegionSearcher {
     pub async fn search_log_groups(
         &self,
         log_groups: &[String],
-        patterns: &[String],
+        params: &SearchParams,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-        limit: i32,
     ) -> Vec<Result<Vec<LogEntry>>> {
         let regional_groups = RegionalLogGroup::parse_many(log_groups);
 
@@ -253,10 +278,9 @@ impl MultiRegionSearcher {
             .map(|rg| {
                 self.search_single_log_group(
                     rg,
-                    patterns.to_vec(),
+                    params.clone(),
                     start_time,
                     end_time,
-                    limit,
                 )
             })
             .collect();
@@ -267,17 +291,16 @@ impl MultiRegionSearcher {
     async fn search_single_log_group(
         &self,
         regional_group: RegionalLogGroup,
-        patterns: Vec<String>,
+        params: SearchParams,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-        limit: i32,
     ) -> Result<Vec<LogEntry>> {
         let client = self
             .client_pool
             .get_client(regional_group.region.as_deref())
             .await?;
 
-        let query = build_insights_query(&patterns, limit);
+        let query = build_insights_query(&params.patterns, &params.exclude, params.limit);
 
         if std::env::var("LOG_HOUND_DEBUG").is_ok() {
             eprintln!(

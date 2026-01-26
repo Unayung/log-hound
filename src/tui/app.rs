@@ -1,4 +1,5 @@
-use crate::aws::{LogEntry, MultiRegionSearcher};
+use crate::aws::{LogEntry, MultiRegionSearcher, SearchParams};
+use crate::config::{Config, Preset};
 use crate::time::TimeRange;
 use anyhow::Result;
 use crossterm::{
@@ -26,7 +27,7 @@ const TIME_RANGES: &[(&str, &str)] = &[
 
 const LIMIT_OPTIONS: &[i32] = &[100, 500, 1000, 5000, 10000];
 
-// Common AWS regions - add more as needed
+// Common AWS regions
 const AWS_REGIONS: &[&str] = &[
     "ap-east-1",
     "ap-east-2",
@@ -49,12 +50,13 @@ const AWS_REGIONS: &[&str] = &[
     "us-west-2",
 ];
 
-// Default enabled regions
 const DEFAULT_ENABLED_REGIONS: &[&str] = &["ap-east-2", "ap-northeast-1"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Focus {
+    Presets,
     Patterns,
+    Exclude,
     Regions,
     LogGroups,
     TimeRange,
@@ -84,8 +86,15 @@ pub struct LogGroupItem {
     pub selected: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PresetItem {
+    pub name: String,
+    pub preset: Preset,
+}
+
 pub struct App {
     pub patterns_input: String,
+    pub exclude_input: String,
     pub time_range_index: usize,
     pub limit_index: usize,
     pub focus: Focus,
@@ -93,6 +102,10 @@ pub struct App {
     pub results_scroll: usize,
     pub search_state: SearchState,
     pub should_quit: bool,
+
+    // Preset selection
+    pub presets: Vec<PresetItem>,
+    pub presets_cursor: usize,
 
     // Region selection
     pub regions: Vec<RegionItem>,
@@ -109,13 +122,15 @@ pub struct App {
     // Horizontal scroll for results
     pub horizontal_scroll: usize,
 
-    // Selected result index (for mouse selection)
+    // Selected result index
     pub selected_result: Option<usize>,
+
+    // Show help overlay
+    pub show_help: bool,
 }
 
 impl App {
-    pub fn new() -> Self {
-        // Initialize regions with defaults enabled
+    pub fn new(config: &Config) -> Self {
         let regions: Vec<RegionItem> = AWS_REGIONS
             .iter()
             .map(|&r| RegionItem {
@@ -124,23 +139,36 @@ impl App {
             })
             .collect();
 
+        let presets: Vec<PresetItem> = config
+            .presets
+            .iter()
+            .map(|(name, preset)| PresetItem {
+                name: name.clone(),
+                preset: preset.clone(),
+            })
+            .collect();
+
         Self {
             patterns_input: String::new(),
-            time_range_index: 3, // Default to 1h (index shifted due to 5m addition)
-            limit_index: 2,      // Default to 1000
-            focus: Focus::Patterns,
+            exclude_input: String::new(),
+            time_range_index: 3,
+            limit_index: 2,
+            focus: if presets.is_empty() { Focus::Patterns } else { Focus::Presets },
             results: Vec::new(),
             results_scroll: 0,
             search_state: SearchState::Idle,
             should_quit: false,
+            presets,
+            presets_cursor: 0,
             regions,
             regions_cursor: 0,
             log_groups: Vec::new(),
             log_groups_cursor: 0,
             log_groups_filter: String::new(),
-            regions_changed: true, // Load on first focus
+            regions_changed: true,
             horizontal_scroll: 0,
             selected_result: None,
+            show_help: false,
         }
     }
 
@@ -154,19 +182,23 @@ impl App {
 
     pub fn next_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::Patterns => Focus::Regions,
+            Focus::Presets => Focus::Patterns,
+            Focus::Patterns => Focus::Exclude,
+            Focus::Exclude => Focus::Regions,
             Focus::Regions => Focus::LogGroups,
             Focus::LogGroups => Focus::TimeRange,
             Focus::TimeRange => Focus::Limit,
             Focus::Limit => Focus::Results,
-            Focus::Results => Focus::Patterns,
+            Focus::Results => if self.presets.is_empty() { Focus::Patterns } else { Focus::Presets },
         };
     }
 
     pub fn prev_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::Patterns => Focus::Results,
-            Focus::Regions => Focus::Patterns,
+            Focus::Presets => Focus::Results,
+            Focus::Patterns => if self.presets.is_empty() { Focus::Results } else { Focus::Presets },
+            Focus::Exclude => Focus::Patterns,
+            Focus::Regions => Focus::Exclude,
             Focus::LogGroups => Focus::Regions,
             Focus::TimeRange => Focus::LogGroups,
             Focus::Limit => Focus::TimeRange,
@@ -199,6 +231,77 @@ impl App {
     pub fn prev_limit(&mut self) {
         if self.limit_index > 0 {
             self.limit_index -= 1;
+        }
+    }
+
+    // Preset navigation
+    pub fn presets_down(&mut self) {
+        if !self.presets.is_empty() && self.presets_cursor < self.presets.len() - 1 {
+            self.presets_cursor += 1;
+        }
+    }
+
+    pub fn presets_up(&mut self) {
+        if self.presets_cursor > 0 {
+            self.presets_cursor -= 1;
+        }
+    }
+
+    pub fn apply_preset(&mut self) {
+        if let Some(item) = self.presets.get(self.presets_cursor) {
+            let preset = &item.preset;
+            
+            // Apply preset patterns
+            if !preset.patterns.is_empty() {
+                self.patterns_input = preset.patterns.join(", ");
+            }
+            
+            // Apply preset exclude
+            if !preset.exclude.is_empty() {
+                self.exclude_input = preset.exclude.join(", ");
+            }
+            
+            // Apply time range if specified
+            if let Some(ref tr) = preset.time_range {
+                if let Some(idx) = TIME_RANGES.iter().position(|(v, _)| *v == tr.as_str()) {
+                    self.time_range_index = idx;
+                }
+            }
+            
+            // Apply limit if specified
+            if let Some(limit) = preset.limit {
+                if let Some(idx) = LIMIT_OPTIONS.iter().position(|&l| l == limit) {
+                    self.limit_index = idx;
+                }
+            }
+            
+            // Clear existing log group selections and apply preset groups
+            for lg in &mut self.log_groups {
+                lg.selected = false;
+            }
+            
+            // Select log groups from preset
+            for preset_group in &preset.groups {
+                // Handle region:group format
+                let (region, group_name) = if preset_group.contains(':') {
+                    let parts: Vec<&str> = preset_group.splitn(2, ':').collect();
+                    (Some(parts[0]), parts[1])
+                } else {
+                    (None, preset_group.as_str())
+                };
+                
+                for lg in &mut self.log_groups {
+                    if lg.name == group_name {
+                        if let Some(r) = region {
+                            if lg.region == r {
+                                lg.selected = true;
+                            }
+                        } else {
+                            lg.selected = true;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -252,7 +355,6 @@ impl App {
         self.horizontal_scroll = self.horizontal_scroll.saturating_add(10);
     }
 
-    /// Select a result by clicking on it (row is relative to results area content)
     pub fn select_result_at_row(&mut self, row: usize) {
         let index = self.results_scroll + row;
         if index < self.results.len() {
@@ -260,12 +362,10 @@ impl App {
         }
     }
 
-    /// Clear selection
     pub fn clear_selection(&mut self) {
         self.selected_result = None;
     }
 
-    // Log group filtering - fuzzy match on name
     pub fn filtered_log_groups_indices(&self) -> Vec<usize> {
         if self.log_groups_filter.is_empty() {
             return (0..self.log_groups.len()).collect();
@@ -279,19 +379,16 @@ impl App {
             .collect()
     }
 
-    // Log group navigation (works with filtered list)
     pub fn log_groups_down(&mut self) {
         let filtered = self.filtered_log_groups_indices();
         if filtered.is_empty() {
             return;
         }
-        // Find current position in filtered list
         if let Some(pos) = filtered.iter().position(|&i| i == self.log_groups_cursor) {
             if pos < filtered.len() - 1 {
                 self.log_groups_cursor = filtered[pos + 1];
             }
         } else {
-            // Cursor not in filtered list, jump to first filtered item
             self.log_groups_cursor = filtered[0];
         }
     }
@@ -306,7 +403,6 @@ impl App {
                 self.log_groups_cursor = filtered[pos - 1];
             }
         } else {
-            // Cursor not in filtered list, jump to first filtered item
             self.log_groups_cursor = filtered[0];
         }
     }
@@ -317,7 +413,6 @@ impl App {
         }
     }
 
-    // Reset cursor to first filtered item when filter changes
     pub fn reset_log_groups_cursor(&mut self) {
         let filtered = self.filtered_log_groups_indices();
         if !filtered.is_empty() {
@@ -339,6 +434,14 @@ impl App {
 
     pub fn get_patterns(&self) -> Vec<String> {
         self.patterns_input
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    pub fn get_exclude(&self) -> Vec<String> {
+        self.exclude_input
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -368,22 +471,23 @@ impl App {
     pub fn selected_log_groups_count(&self) -> usize {
         self.log_groups.iter().filter(|g| g.selected).count()
     }
+
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
 }
 
-pub async fn run_tui(searcher: MultiRegionSearcher) -> Result<()> {
-    // Setup terminal
-    // Note: Mouse capture is disabled to allow native terminal text selection for copy/paste
+pub async fn run_tui(searcher: MultiRegionSearcher, config: Config) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new(&config);
 
     let result = run_app(&mut terminal, &mut app, &searcher).await;
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -430,17 +534,27 @@ async fn run_app(
     app: &mut App,
     searcher: &MultiRegionSearcher,
 ) -> Result<()> {
-    // Initial load of log groups for default regions
     load_log_groups(app, searcher).await;
 
     loop {
         terminal.draw(|f| ui::render(f, app))?;
 
-        // Poll for events with timeout
         if event::poll(std::time::Duration::from_millis(100))? {
             let event = event::read()?;
 
             if let Event::Key(key) = event {
+                // Help toggle
+                if key.code == KeyCode::F(1) || (key.code == KeyCode::Char('?') && app.focus == Focus::Results) {
+                    app.toggle_help();
+                    continue;
+                }
+
+                // Close help with any key
+                if app.show_help {
+                    app.show_help = false;
+                    continue;
+                }
+
                 // Global keybindings
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
@@ -454,7 +568,6 @@ async fn run_app(
                             app.deselect_all_log_groups();
                         }
                         KeyCode::Char('r') => {
-                            // Force refresh log groups
                             load_log_groups(app, searcher).await;
                         }
                         _ => {}
@@ -467,7 +580,6 @@ async fn run_app(
 
                 match key.code {
                     KeyCode::Tab => {
-                        // If leaving regions and they changed, reload log groups
                         if app.focus == Focus::Regions && app.regions_changed {
                             load_log_groups(app, searcher).await;
                         }
@@ -480,27 +592,31 @@ async fn run_app(
                         app.prev_focus();
                     }
                     KeyCode::Enter => {
-                        // Enter triggers search from any section except Results
-                        if app.focus != Focus::Results {
+                        // Apply preset on Enter in Presets section
+                        if app.focus == Focus::Presets {
+                            app.apply_preset();
+                            app.next_focus();
+                        } else if app.focus != Focus::Results {
+                            // Search
                             let patterns = app.get_patterns();
+                            let exclude = app.get_exclude();
                             let groups = app.get_selected_log_groups();
 
-                            if !patterns.is_empty() && !groups.is_empty() {
+                            if !groups.is_empty() {
                                 app.search_state = SearchState::Searching;
                                 app.results.clear();
 
-                                let time_range =
-                                    TimeRange::from_relative(app.time_range_value());
+                                let time_range = TimeRange::from_relative(app.time_range_value());
                                 match time_range {
                                     Ok(tr) => {
+                                        let params = SearchParams::new(
+                                            patterns,
+                                            exclude,
+                                            app.limit_value(),
+                                        );
+
                                         let results = searcher
-                                            .search_log_groups(
-                                                &groups,
-                                                &patterns,
-                                                tr.start,
-                                                tr.end,
-                                                app.limit_value(),
-                                            )
+                                            .search_log_groups(&groups, &params, tr.start, tr.end)
                                             .await;
 
                                         let mut all_entries = Vec::new();
@@ -513,8 +629,7 @@ async fn run_app(
                                             }
                                         }
 
-                                        all_entries
-                                            .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                                        all_entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
                                         let count = all_entries.len();
                                         app.results = all_entries;
@@ -525,8 +640,7 @@ async fn run_app(
                                         } else if count > 0 {
                                             app.search_state = SearchState::Complete(count);
                                         } else {
-                                            app.search_state =
-                                                SearchState::Error(errors.join("; "));
+                                            app.search_state = SearchState::Error(errors.join("; "));
                                         }
 
                                         app.focus = Focus::Results;
@@ -542,7 +656,6 @@ async fn run_app(
                         match app.focus {
                             Focus::Regions => {
                                 app.toggle_region();
-                                // Don't reload immediately - wait for Tab
                             }
                             Focus::LogGroups => {
                                 app.toggle_log_group();
@@ -554,16 +667,22 @@ async fn run_app(
                         if app.focus == Focus::Results {
                             app.focus = Focus::Patterns;
                         } else if app.focus == Focus::LogGroups && !app.log_groups_filter.is_empty() {
-                            // Clear filter with Esc
                             app.log_groups_filter.clear();
                             app.reset_log_groups_cursor();
                         }
                     }
                     _ => {
-                        // Focus-specific keybindings
                         match app.focus {
+                            Focus::Presets => match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => app.presets_up(),
+                                KeyCode::Down | KeyCode::Char('j') => app.presets_down(),
+                                _ => {}
+                            },
                             Focus::Patterns => {
                                 handle_text_input(key.code, &mut app.patterns_input)
+                            }
+                            Focus::Exclude => {
+                                handle_text_input(key.code, &mut app.exclude_input)
                             }
                             Focus::Regions => match key.code {
                                 KeyCode::Up | KeyCode::Char('k') => app.regions_up(),
@@ -574,7 +693,6 @@ async fn run_app(
                                 KeyCode::Up => app.log_groups_up(),
                                 KeyCode::Down => app.log_groups_down(),
                                 KeyCode::Char(c) => {
-                                    // Type to filter
                                     app.log_groups_filter.push(c);
                                     app.reset_log_groups_cursor();
                                 }
@@ -631,4 +749,3 @@ fn handle_text_input(key: KeyCode, input: &mut String) {
         _ => {}
     }
 }
-

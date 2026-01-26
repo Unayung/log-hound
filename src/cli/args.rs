@@ -24,15 +24,26 @@ pub enum Commands {
   log-hound search \"ERROR\" -g my-app/production
   log-hound search \"user_id=123\" -g api/logs,web/logs --last 2h
   log-hound search \"timeout\" -g service/prod --limit 50 -o grouped
-  log-hound search \"ERROR\" \"user_id=123\" -g app/logs  # AND condition")]
+  log-hound search \"ERROR\" \"user_id=123\" -g app/logs  # AND condition
+  log-hound search \"ERROR\" -g app/logs --exclude health-check
+  log-hound search \"ERROR\" -p production  # Use preset
+  log-hound search \"ERROR\" -g app/logs -o json  # JSON output")]
     Search {
         /// Search patterns to match in @message (multiple = AND condition)
-        #[arg(required = true)]
+        #[arg(required_unless_present = "preset")]
         patterns: Vec<String>,
 
-        /// Log groups to search (required, comma-separated for multiple)
-        #[arg(short, long, value_delimiter = ',', required = true)]
+        /// Log groups to search (comma-separated for multiple)
+        #[arg(short, long, value_delimiter = ',')]
         groups: Vec<String>,
+
+        /// Use a saved preset from config
+        #[arg(short, long)]
+        preset: Option<String>,
+
+        /// Exclude patterns (NOT condition, comma-separated)
+        #[arg(short = 'x', long, value_delimiter = ',')]
+        exclude: Vec<String>,
 
         /// Time range: e.g., "1h", "30m", "2d"
         #[arg(short, long, default_value = "1h")]
@@ -65,9 +76,27 @@ pub enum Commands {
     /// Launch interactive TUI mode
     #[command(alias = "ui")]
     Tui,
+
+    /// Manage configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
-#[derive(ValueEnum, Clone, Debug, Default)]
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Show current configuration
+    Show,
+    /// Show config file path
+    Path,
+    /// Generate a sample configuration file
+    Init,
+    /// List available presets
+    Presets,
+}
+
+#[derive(ValueEnum, Clone, Debug, Default, PartialEq)]
 pub enum OutputMode {
     /// Results merged and sorted by timestamp
     #[default]
@@ -76,4 +105,6 @@ pub enum OutputMode {
     Grouped,
     /// Results displayed as they arrive
     Streaming,
+    /// JSON output for AI/programmatic use
+    Json,
 }
