@@ -2,7 +2,7 @@
 
 **The AI-first AWS CloudWatch log search tool.**
 
-Built for seamless integration with AI coding assistants like Claude, Cursor, and Copilot. Search your production logs with natural, readable output that AI can understand and act upon.
+Built for seamless integration with AI coding assistants like Claude, Cursor, and Copilot. Search your production logs across multiple AWS regions with natural, readable output that AI can understand and act upon.
 
 ## Why AI-First?
 
@@ -15,13 +15,13 @@ Traditional log tools output noisy, hard-to-parse data. Log Hound is designed di
 
 ## Features
 
+- 🌍 **Cross-Region Search** - Query multiple AWS regions in a single command
 - 🔍 **Fast Concurrent Search** - Query multiple log groups in parallel
 - 🤖 **AI-Optimized Output** - Clean, parseable results for AI analysis
 - 📊 **Multiple Output Modes** - Interleaved, grouped, or streaming
 - 🖥️ **Interactive TUI** - Terminal UI for manual exploration
 - ⏰ **Flexible Time Ranges** - Relative (`1h`, `30m`, `2d`) or absolute
 - 🔗 **AND Conditions** - Multiple patterns combined with AND logic
-- 🌍 **Multi-Region Support** - Search across AWS regions
 
 ## Installation
 
@@ -37,10 +37,20 @@ cargo build --release
 
 ## Usage
 
-### Search Logs
+### Cross-Region Search
 
 ```bash
-# Basic search
+# Search across regions in one command
+log-hound search "ERROR" -g us-east-1:app/prod,ap-northeast-1:app/prod --last 1h
+
+# Compare logs between regions
+log-hound search "timeout" -g us-west-2:api/logs,eu-west-1:api/logs --last 2h
+```
+
+### Basic Search
+
+```bash
+# Single log group
 log-hound search "ERROR" -g my-app/production
 
 # Multiple log groups
@@ -90,8 +100,8 @@ log-hound --region us-west-2 groups
 ## Example: AI Debugging Session
 
 ```bash
-# AI asks: "Find recent errors in production"
-log-hound search "ERROR" -g pluto/production --last 1h
+# AI asks: "Find recent errors across all regions"
+log-hound search "ERROR" -g us-east-1:app/prod,ap-northeast-1:app/prod --last 1h
 
 # AI asks: "Search for this specific user's activity"  
 log-hound search "user_id=12345" -g api/prod,web/prod --last 24h
