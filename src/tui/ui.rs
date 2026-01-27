@@ -158,20 +158,23 @@ pub fn render(f: &mut Frame, app: &App) {
     };
 
     let has_presets = !app.presets.is_empty();
-    let presets_height = if has_presets { 3 } else { 0 };
+
+    // Build constraints dynamically to avoid empty slots
+    let mut constraints: Vec<Constraint> = Vec::new();
+    if has_presets {
+        constraints.push(Constraint::Length(3));            // Presets
+    }
+    constraints.push(Constraint::Length(3));                // Patterns input
+    constraints.push(Constraint::Length(3));                // Exclude input
+    constraints.push(Constraint::Length(selection_height as u16)); // Regions + Log groups
+    constraints.push(Constraint::Length(3));                // Time range + Limit + Status
+    constraints.push(Constraint::Min(6));                   // Results
+    constraints.push(Constraint::Length(2));                // Help
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([
-            Constraint::Length(presets_height as u16),      // Presets (if any)
-            Constraint::Length(3),                          // Patterns input
-            Constraint::Length(3),                          // Exclude input
-            Constraint::Length(selection_height as u16),    // Regions + Log groups
-            Constraint::Length(3),                          // Time range + Limit + Status
-            Constraint::Min(6),                             // Results
-            Constraint::Length(2),                          // Help
-        ])
+        .constraints(constraints)
         .split(f.area());
 
     let mut chunk_idx = 0;
