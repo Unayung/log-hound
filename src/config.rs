@@ -35,7 +35,8 @@ pub struct Config {
 /// A saved preset configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preset {
-    /// Log groups to search
+    /// Log groups to search (CloudWatch only)
+    #[serde(default)]
     pub groups: Vec<String>,
 
     /// Optional default patterns to include
@@ -57,6 +58,14 @@ pub struct Preset {
     /// Description for this preset
     #[serde(default)]
     pub description: Option<String>,
+
+    /// Log source: "cloudwatch" or "kamal"
+    #[serde(default)]
+    pub source: Option<String>,
+
+    /// Kamal deploy.yml file path (for source = "kamal")
+    #[serde(default)]
+    pub deploy_file: Option<String>,
 }
 
 impl Config {
@@ -135,6 +144,17 @@ groups = [
     "ap-northeast-1:app/prod",
     "eu-west-1:app/prod"
 ]
+
+# Kamal deployment presets
+# Use with: log-hound search -p <preset_name> "ERROR"
+
+[presets.my-app]
+description = "My Kamal-deployed app"
+source = "kamal"
+deploy_file = "config/deploy.yml"
+time_range = "1h"
+limit = 200
+exclude = ["health-check", "ping"]
 "#
         .to_string()
     }

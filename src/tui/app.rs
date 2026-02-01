@@ -1,6 +1,10 @@
 use crate::aws::{LogEntry, MultiRegionSearcher, SearchParams};
-use crate::config::{Config, Preset};
+use crate::config::Config;
+use crate::kamal::{KamalSearcher, KamalSearchParams};
 use crate::time::TimeRange;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -9,6 +13,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use tokio::sync::mpsc;
 
 use super::ui;
 
@@ -54,14 +59,22 @@ const DEFAULT_ENABLED_REGIONS: &[&str] = &["ap-east-2", "ap-northeast-1"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Focus {
-    Presets,
+    Source,
+    DeployFile,  // Kamal only - list of detected deploy files
     Patterns,
     Exclude,
-    Regions,
-    LogGroups,
+    Regions,     // CloudWatch only
+    LogGroups,   // CloudWatch only
     TimeRange,
     Limit,
     Results,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SourceMode {
+    #[default]
+    CloudWatch,
+    Kamal,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,12 +99,6 @@ pub struct LogGroupItem {
     pub selected: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct PresetItem {
-    pub name: String,
-    pub preset: Preset,
-}
-
 pub struct App {
     pub patterns_input: String,
     pub exclude_input: String,
@@ -103,15 +110,19 @@ pub struct App {
     pub search_state: SearchState,
     pub should_quit: bool,
 
-    // Preset selection
-    pub presets: Vec<PresetItem>,
-    pub presets_cursor: usize,
+    // Source selection (CloudWatch vs Kamal)
+    pub source_mode: SourceMode,
 
-    // Region selection
+    // Deploy file selection (Kamal only) - detected from config/ folder
+    pub deploy_files: Vec<String>,
+    pub deploy_files_cursor: usize,
+    pub deploy_files_filter: String,
+
+    // Region selection (CloudWatch only)
     pub regions: Vec<RegionItem>,
     pub regions_cursor: usize,
 
-    // Log group selection
+    // Log group selection (CloudWatch only)
     pub log_groups: Vec<LogGroupItem>,
     pub log_groups_cursor: usize,
     pub log_groups_filter: String,
@@ -127,10 +138,16 @@ pub struct App {
 
     // Show help overlay
     pub show_help: bool,
+
+    // Follow mode - stream logs in real-time
+    pub follow_mode: bool,
+    pub is_following: bool,
+    pub follow_receiver: Option<mpsc::Receiver<LogEntry>>,
+    pub follow_stop_flag: Option<Arc<AtomicBool>>,
 }
 
 impl App {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(_config: &Config) -> Self {
         let regions: Vec<RegionItem> = AWS_REGIONS
             .iter()
             .map(|&r| RegionItem {
@@ -139,27 +156,23 @@ impl App {
             })
             .collect();
 
-        let presets: Vec<PresetItem> = config
-            .presets
-            .iter()
-            .map(|(name, preset)| PresetItem {
-                name: name.clone(),
-                preset: preset.clone(),
-            })
-            .collect();
+        // Detect deploy files from config/ folder
+        let deploy_files = Self::detect_deploy_files();
 
         Self {
             patterns_input: String::new(),
             exclude_input: String::new(),
             time_range_index: 3,
             limit_index: 2,
-            focus: if presets.is_empty() { Focus::Patterns } else { Focus::Presets },
+            focus: Focus::Source,
             results: Vec::new(),
             results_scroll: 0,
             search_state: SearchState::Idle,
             should_quit: false,
-            presets,
-            presets_cursor: 0,
+            source_mode: SourceMode::CloudWatch,
+            deploy_files,
+            deploy_files_cursor: 0,
+            deploy_files_filter: String::new(),
             regions,
             regions_cursor: 0,
             log_groups: Vec::new(),
@@ -169,7 +182,29 @@ impl App {
             horizontal_scroll: 0,
             selected_result: None,
             show_help: false,
+            follow_mode: false,
+            is_following: false,
+            follow_receiver: None,
+            follow_stop_flag: None,
         }
+    }
+
+    pub fn toggle_follow_mode(&mut self) {
+        // Don't toggle if currently following
+        if !self.is_following {
+            self.follow_mode = !self.follow_mode;
+        }
+    }
+
+    pub fn stop_following(&mut self) {
+        // Signal the background task to stop
+        if let Some(stop_flag) = &self.follow_stop_flag {
+            stop_flag.store(true, Ordering::Relaxed);
+        }
+        self.is_following = false;
+        self.follow_receiver = None;
+        self.follow_stop_flag = None;
+        self.search_state = SearchState::Complete(self.results.len());
     }
 
     pub fn time_range_label(&self) -> &str {
@@ -181,29 +216,158 @@ impl App {
     }
 
     pub fn next_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Presets => Focus::Patterns,
-            Focus::Patterns => Focus::Exclude,
-            Focus::Exclude => Focus::Regions,
-            Focus::Regions => Focus::LogGroups,
-            Focus::LogGroups => Focus::TimeRange,
-            Focus::TimeRange => Focus::Limit,
-            Focus::Limit => Focus::Results,
-            Focus::Results => if self.presets.is_empty() { Focus::Patterns } else { Focus::Presets },
+        self.focus = match (&self.focus, &self.source_mode) {
+            (Focus::Source, SourceMode::CloudWatch) => Focus::Patterns,
+            (Focus::Source, SourceMode::Kamal) => Focus::DeployFile,
+            (Focus::DeployFile, _) => Focus::Patterns,
+            (Focus::Patterns, _) => Focus::Exclude,
+            (Focus::Exclude, SourceMode::CloudWatch) => Focus::Regions,
+            (Focus::Exclude, SourceMode::Kamal) => Focus::TimeRange,
+            (Focus::Regions, _) => Focus::LogGroups,
+            (Focus::LogGroups, _) => Focus::TimeRange,
+            (Focus::TimeRange, _) => Focus::Limit,
+            (Focus::Limit, _) => Focus::Results,
+            (Focus::Results, _) => Focus::Source,
         };
     }
 
     pub fn prev_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Presets => Focus::Results,
-            Focus::Patterns => if self.presets.is_empty() { Focus::Results } else { Focus::Presets },
-            Focus::Exclude => Focus::Patterns,
-            Focus::Regions => Focus::Exclude,
-            Focus::LogGroups => Focus::Regions,
-            Focus::TimeRange => Focus::LogGroups,
-            Focus::Limit => Focus::TimeRange,
-            Focus::Results => Focus::Limit,
+        self.focus = match (&self.focus, &self.source_mode) {
+            (Focus::Source, _) => Focus::Results,
+            (Focus::DeployFile, _) => Focus::Source,
+            (Focus::Patterns, SourceMode::CloudWatch) => Focus::Source,
+            (Focus::Patterns, SourceMode::Kamal) => Focus::DeployFile,
+            (Focus::Exclude, _) => Focus::Patterns,
+            (Focus::Regions, _) => Focus::Exclude,
+            (Focus::LogGroups, _) => Focus::Regions,
+            (Focus::TimeRange, SourceMode::CloudWatch) => Focus::LogGroups,
+            (Focus::TimeRange, SourceMode::Kamal) => Focus::Exclude,
+            (Focus::Limit, _) => Focus::TimeRange,
+            (Focus::Results, _) => Focus::Limit,
         };
+    }
+
+    pub fn toggle_source(&mut self) {
+        self.source_mode = match self.source_mode {
+            SourceMode::CloudWatch => {
+                // Refresh deploy files when switching to Kamal
+                self.deploy_files = Self::detect_deploy_files();
+                self.deploy_files_cursor = 0;
+                SourceMode::Kamal
+            }
+            SourceMode::Kamal => SourceMode::CloudWatch,
+        };
+    }
+
+    /// Detect deploy*.yml files from config/ folder
+    fn detect_deploy_files() -> Vec<String> {
+        let config_path = Path::new("config");
+        let mut files = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(config_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("deploy") && name.ends_with(".yml") {
+                        files.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+
+        // Sort by simplified display name (alphabetically)
+        files.sort_by(|a, b| {
+            let name_a = Self::extract_deploy_name(a);
+            let name_b = Self::extract_deploy_name(b);
+            name_a.cmp(&name_b)
+        });
+
+        // If no files found, add a default
+        if files.is_empty() {
+            files.push("config/deploy.yml".to_string());
+        }
+
+        files
+    }
+
+    /// Extract simplified name from deploy file path: deploy.production.yml -> production
+    fn extract_deploy_name(path: &str) -> String {
+        let filename = Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+
+        let name = filename
+            .strip_prefix("deploy.")
+            .unwrap_or(filename)
+            .trim_end_matches(".yml")
+            .trim_end_matches(".yaml");
+
+        if name.is_empty() || name == "yml" {
+            "default".to_string()
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// Get the currently selected deploy file
+    pub fn selected_deploy_file(&self) -> &str {
+        let filtered = self.filtered_deploy_files_indices();
+        if let Some(&idx) = filtered.iter().find(|&&i| i == self.deploy_files_cursor) {
+            self.deploy_files.get(idx).map(|s| s.as_str()).unwrap_or("config/deploy.yml")
+        } else if let Some(&first_idx) = filtered.first() {
+            self.deploy_files.get(first_idx).map(|s| s.as_str()).unwrap_or("config/deploy.yml")
+        } else {
+            "config/deploy.yml"
+        }
+    }
+
+    /// Get filtered deploy files indices based on current filter
+    pub fn filtered_deploy_files_indices(&self) -> Vec<usize> {
+        if self.deploy_files_filter.is_empty() {
+            return (0..self.deploy_files.len()).collect();
+        }
+        let filter_lower = self.deploy_files_filter.to_lowercase();
+        self.deploy_files
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| {
+                let name = Self::extract_deploy_name(path).to_lowercase();
+                name.contains(&filter_lower)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Reset deploy files cursor to first filtered item
+    pub fn reset_deploy_files_cursor(&mut self) {
+        let filtered = self.filtered_deploy_files_indices();
+        if let Some(&first) = filtered.first() {
+            self.deploy_files_cursor = first;
+        }
+    }
+
+    // Deploy file navigation (filter-aware)
+    pub fn deploy_files_down(&mut self) {
+        let filtered = self.filtered_deploy_files_indices();
+        if let Some(pos) = filtered.iter().position(|&i| i == self.deploy_files_cursor) {
+            if pos + 1 < filtered.len() {
+                self.deploy_files_cursor = filtered[pos + 1];
+            }
+        } else if let Some(&first) = filtered.first() {
+            self.deploy_files_cursor = first;
+        }
+    }
+
+    pub fn deploy_files_up(&mut self) {
+        let filtered = self.filtered_deploy_files_indices();
+        if let Some(pos) = filtered.iter().position(|&i| i == self.deploy_files_cursor) {
+            if pos > 0 {
+                self.deploy_files_cursor = filtered[pos - 1];
+            }
+        } else if let Some(&first) = filtered.first() {
+            self.deploy_files_cursor = first;
+        }
     }
 
     pub fn next_time_range(&mut self) {
@@ -231,77 +395,6 @@ impl App {
     pub fn prev_limit(&mut self) {
         if self.limit_index > 0 {
             self.limit_index -= 1;
-        }
-    }
-
-    // Preset navigation
-    pub fn presets_down(&mut self) {
-        if !self.presets.is_empty() && self.presets_cursor < self.presets.len() - 1 {
-            self.presets_cursor += 1;
-        }
-    }
-
-    pub fn presets_up(&mut self) {
-        if self.presets_cursor > 0 {
-            self.presets_cursor -= 1;
-        }
-    }
-
-    pub fn apply_preset(&mut self) {
-        if let Some(item) = self.presets.get(self.presets_cursor) {
-            let preset = &item.preset;
-            
-            // Apply preset patterns
-            if !preset.patterns.is_empty() {
-                self.patterns_input = preset.patterns.join(", ");
-            }
-            
-            // Apply preset exclude
-            if !preset.exclude.is_empty() {
-                self.exclude_input = preset.exclude.join(", ");
-            }
-            
-            // Apply time range if specified
-            if let Some(ref tr) = preset.time_range {
-                if let Some(idx) = TIME_RANGES.iter().position(|(v, _)| *v == tr.as_str()) {
-                    self.time_range_index = idx;
-                }
-            }
-            
-            // Apply limit if specified
-            if let Some(limit) = preset.limit {
-                if let Some(idx) = LIMIT_OPTIONS.iter().position(|&l| l == limit) {
-                    self.limit_index = idx;
-                }
-            }
-            
-            // Clear existing log group selections and apply preset groups
-            for lg in &mut self.log_groups {
-                lg.selected = false;
-            }
-            
-            // Select log groups from preset
-            for preset_group in &preset.groups {
-                // Handle region:group format
-                let (region, group_name) = if preset_group.contains(':') {
-                    let parts: Vec<&str> = preset_group.splitn(2, ':').collect();
-                    (Some(parts[0]), parts[1])
-                } else {
-                    (None, preset_group.as_str())
-                };
-                
-                for lg in &mut self.log_groups {
-                    if lg.name == group_name {
-                        if let Some(r) = region {
-                            if lg.region == r {
-                                lg.selected = true;
-                            }
-                        } else {
-                            lg.selected = true;
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -536,7 +629,59 @@ async fn run_app(
 ) -> Result<()> {
     load_log_groups(app, searcher).await;
 
+    // For CloudWatch polling in follow mode
+    let mut last_poll_time = std::time::Instant::now();
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
     loop {
+        // Check for new entries from follow mode channel
+        if let Some(ref mut receiver) = app.follow_receiver {
+            while let Ok(entry) = receiver.try_recv() {
+                // Insert at beginning (newest first) and maintain scroll position
+                app.results.insert(0, entry);
+                // Keep results from growing unbounded
+                if app.results.len() > 10000 {
+                    app.results.pop();
+                }
+                app.search_state = SearchState::Complete(app.results.len());
+            }
+        }
+
+        // CloudWatch follow mode: periodic polling
+        if app.is_following && app.source_mode == SourceMode::CloudWatch {
+            if last_poll_time.elapsed() >= POLL_INTERVAL {
+                last_poll_time = std::time::Instant::now();
+
+                let patterns = app.get_patterns();
+                let exclude = app.get_exclude();
+                let groups = app.get_selected_log_groups();
+
+                if !groups.is_empty() {
+                    if let Ok(tr) = TimeRange::from_relative("1m") {
+                        let params = SearchParams::new(patterns, exclude, 100);
+                        let results = searcher.search_log_groups(&groups, &params, tr.start, tr.end).await;
+
+                        for result in results {
+                            if let Ok(entries) = result {
+                                for entry in entries {
+                                    // Avoid duplicates by checking timestamp
+                                    if !app.results.iter().take(100).any(|e| e.timestamp == entry.timestamp && e.message == entry.message) {
+                                        app.results.insert(0, entry);
+                                    }
+                                }
+                            }
+                        }
+                        // Sort and limit
+                        app.results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                        if app.results.len() > 10000 {
+                            app.results.truncate(10000);
+                        }
+                        app.search_state = SearchState::Complete(app.results.len());
+                    }
+                }
+            }
+        }
+
         terminal.draw(|f| ui::render(f, app))?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
@@ -557,20 +702,8 @@ async fn run_app(
 
                 // Global keybindings
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    match key.code {
-                        KeyCode::Char('c') | KeyCode::Char('q') => {
-                            app.should_quit = true;
-                        }
-                        KeyCode::Char('a') if app.focus == Focus::LogGroups => {
-                            app.select_all_log_groups();
-                        }
-                        KeyCode::Char('d') if app.focus == Focus::LogGroups => {
-                            app.deselect_all_log_groups();
-                        }
-                        KeyCode::Char('r') => {
-                            load_log_groups(app, searcher).await;
-                        }
-                        _ => {}
+                    if key.code == KeyCode::Char('c') || key.code == KeyCode::Char('q') {
+                        app.should_quit = true;
                     }
                 }
 
@@ -580,73 +713,158 @@ async fn run_app(
 
                 match key.code {
                     KeyCode::Tab => {
-                        if app.focus == Focus::Regions && app.regions_changed {
+                        if app.source_mode == SourceMode::CloudWatch && app.focus == Focus::Regions && app.regions_changed {
                             load_log_groups(app, searcher).await;
                         }
                         app.next_focus();
                     }
                     KeyCode::BackTab => {
-                        if app.focus == Focus::LogGroups && app.regions_changed {
+                        if app.source_mode == SourceMode::CloudWatch && app.focus == Focus::LogGroups && app.regions_changed {
                             load_log_groups(app, searcher).await;
                         }
                         app.prev_focus();
                     }
                     KeyCode::Enter => {
-                        // Apply preset on Enter in Presets section
-                        if app.focus == Focus::Presets {
-                            app.apply_preset();
-                            app.next_focus();
-                        } else if app.focus != Focus::Results {
-                            // Search
-                            let patterns = app.get_patterns();
-                            let exclude = app.get_exclude();
-                            let groups = app.get_selected_log_groups();
+                        if app.focus != Focus::Results {
+                            // Search based on source mode
+                            match app.source_mode {
+                                SourceMode::CloudWatch => {
+                                    let patterns = app.get_patterns();
+                                    let exclude = app.get_exclude();
+                                    let groups = app.get_selected_log_groups();
 
-                            if !groups.is_empty() {
-                                app.search_state = SearchState::Searching;
-                                app.results.clear();
+                                    if !groups.is_empty() {
+                                        app.search_state = SearchState::Searching;
+                                        app.results.clear();
 
-                                let time_range = TimeRange::from_relative(app.time_range_value());
-                                match time_range {
-                                    Ok(tr) => {
-                                        let params = SearchParams::new(
-                                            patterns,
-                                            exclude,
-                                            app.limit_value(),
-                                        );
+                                        let time_range = TimeRange::from_relative(app.time_range_value());
+                                        match time_range {
+                                            Ok(tr) => {
+                                                let params = SearchParams::new(
+                                                    patterns,
+                                                    exclude,
+                                                    app.limit_value(),
+                                                );
 
-                                        let results = searcher
-                                            .search_log_groups(&groups, &params, tr.start, tr.end)
-                                            .await;
+                                                let results = searcher
+                                                    .search_log_groups(&groups, &params, tr.start, tr.end)
+                                                    .await;
 
-                                        let mut all_entries = Vec::new();
-                                        let mut errors = Vec::new();
+                                                let mut all_entries = Vec::new();
+                                                let mut errors = Vec::new();
 
-                                        for result in results {
-                                            match result {
-                                                Ok(entries) => all_entries.extend(entries),
-                                                Err(e) => errors.push(e.to_string()),
+                                                for result in results {
+                                                    match result {
+                                                        Ok(entries) => all_entries.extend(entries),
+                                                        Err(e) => errors.push(e.to_string()),
+                                                    }
+                                                }
+
+                                                all_entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+                                                let count = all_entries.len();
+                                                app.results = all_entries;
+                                                app.results_scroll = 0;
+
+                                                if errors.is_empty() {
+                                                    app.search_state = SearchState::Complete(count);
+                                                } else if count > 0 {
+                                                    app.search_state = SearchState::Complete(count);
+                                                } else {
+                                                    app.search_state = SearchState::Error(errors.join("; "));
+                                                }
+
+                                                // Enable follow mode polling if requested
+                                                if app.follow_mode {
+                                                    app.is_following = true;
+                                                    last_poll_time = std::time::Instant::now();
+                                                }
+
+                                                app.focus = Focus::Results;
+                                            }
+                                            Err(e) => {
+                                                app.search_state = SearchState::Error(e.to_string());
                                             }
                                         }
-
-                                        all_entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-                                        let count = all_entries.len();
-                                        app.results = all_entries;
-                                        app.results_scroll = 0;
-
-                                        if errors.is_empty() {
-                                            app.search_state = SearchState::Complete(count);
-                                        } else if count > 0 {
-                                            app.search_state = SearchState::Complete(count);
-                                        } else {
-                                            app.search_state = SearchState::Error(errors.join("; "));
-                                        }
-
-                                        app.focus = Focus::Results;
                                     }
-                                    Err(e) => {
-                                        app.search_state = SearchState::Error(e.to_string());
+                                }
+                                SourceMode::Kamal => {
+                                    // Search using KamalSearcher
+                                    let patterns = app.get_patterns();
+                                    let exclude = app.get_exclude();
+
+                                    app.search_state = SearchState::Searching;
+                                    app.results.clear();
+
+                                    match KamalSearcher::from_file(app.selected_deploy_file()) {
+                                        Ok(kamal_searcher) => {
+                                            let since = crate::time::to_docker_since(app.time_range_value());
+                                            match since {
+                                                Ok(since_str) => {
+                                                    let params = KamalSearchParams {
+                                                        patterns,
+                                                        exclude,
+                                                        limit: app.limit_value() as usize,
+                                                        since: Some(since_str),
+                                                        follow: app.follow_mode,
+                                                    };
+
+                                                    if app.follow_mode {
+                                                        // Start follow mode with channel
+                                                        let (tx, rx) = mpsc::channel(1000);
+                                                        let stop_flag = Arc::new(AtomicBool::new(false));
+
+                                                        match kamal_searcher.follow_logs_channel(&params, tx, stop_flag.clone()).await {
+                                                            Ok(()) => {
+                                                                app.follow_receiver = Some(rx);
+                                                                app.follow_stop_flag = Some(stop_flag);
+                                                                app.is_following = true;
+                                                                app.search_state = SearchState::Searching;
+                                                                app.focus = Focus::Results;
+                                                            }
+                                                            Err(e) => {
+                                                                app.search_state = SearchState::Error(format!("Follow failed: {}", e));
+                                                            }
+                                                        }
+                                                    } else {
+                                                        // Regular search
+                                                        let results = kamal_searcher.search_logs(&params).await;
+
+                                                        let mut all_entries = Vec::new();
+                                                        let mut errors = Vec::new();
+
+                                                        for result in results {
+                                                            match result {
+                                                                Ok(entries) => all_entries.extend(entries),
+                                                                Err(e) => errors.push(e.to_string()),
+                                                            }
+                                                        }
+
+                                                        all_entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+                                                        let count = all_entries.len();
+                                                        app.results = all_entries;
+                                                        app.results_scroll = 0;
+
+                                                        if errors.is_empty() {
+                                                            app.search_state = SearchState::Complete(count);
+                                                        } else if count > 0 {
+                                                            app.search_state = SearchState::Complete(count);
+                                                        } else {
+                                                            app.search_state = SearchState::Error(errors.join("; "));
+                                                        }
+
+                                                        app.focus = Focus::Results;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    app.search_state = SearchState::Error(e.to_string());
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            app.search_state = SearchState::Error(format!("Failed to load deploy file: {}", e));
+                                        }
                                     }
                                 }
                             }
@@ -664,18 +882,92 @@ async fn run_app(
                         }
                     }
                     KeyCode::Esc => {
-                        if app.focus == Focus::Results {
+                        if app.is_following {
+                            // Stop follow mode
+                            app.stop_following();
+                        } else if app.focus == Focus::Results {
                             app.focus = Focus::Patterns;
+                        } else if app.focus == Focus::DeployFile && !app.deploy_files_filter.is_empty() {
+                            app.deploy_files_filter.clear();
+                            app.reset_deploy_files_cursor();
                         } else if app.focus == Focus::LogGroups && !app.log_groups_filter.is_empty() {
                             app.log_groups_filter.clear();
                             app.reset_log_groups_cursor();
                         }
                     }
+                    KeyCode::Char('f') if app.focus != Focus::Patterns && app.focus != Focus::Exclude && app.focus != Focus::LogGroups && app.focus != Focus::DeployFile => {
+                        if app.is_following {
+                            // Stop following
+                            app.stop_following();
+                        } else if app.focus == Focus::Results {
+                            // Start following immediately from Results view
+                            app.follow_mode = true;
+
+                            match app.source_mode {
+                                SourceMode::CloudWatch => {
+                                    // For CloudWatch, just enable polling mode
+                                    app.is_following = true;
+                                    last_poll_time = std::time::Instant::now();
+                                }
+                                SourceMode::Kamal => {
+                                    // Start Kamal follow mode
+                                    let patterns = app.get_patterns();
+                                    let exclude = app.get_exclude();
+
+                                    if let Ok(kamal_searcher) = KamalSearcher::from_file(app.selected_deploy_file()) {
+                                        if let Ok(since_str) = crate::time::to_docker_since("1m") {
+                                            let params = KamalSearchParams {
+                                                patterns,
+                                                exclude,
+                                                limit: app.limit_value() as usize,
+                                                since: Some(since_str),
+                                                follow: true,
+                                            };
+
+                                            let (tx, rx) = mpsc::channel(1000);
+                                            let stop_flag = Arc::new(AtomicBool::new(false));
+
+                                            if kamal_searcher.follow_logs_channel(&params, tx, stop_flag.clone()).await.is_ok() {
+                                                app.follow_receiver = Some(rx);
+                                                app.follow_stop_flag = Some(stop_flag);
+                                                app.is_following = true;
+                                                app.search_state = SearchState::Complete(app.results.len());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Toggle follow mode for next search
+                            app.toggle_follow_mode();
+                        }
+                    }
                     _ => {
                         match app.focus {
-                            Focus::Presets => match key.code {
-                                KeyCode::Up | KeyCode::Char('k') => app.presets_up(),
-                                KeyCode::Down | KeyCode::Char('j') => app.presets_down(),
+                            Focus::Source => match key.code {
+                                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                                    app.toggle_source();
+                                }
+                                _ => {}
+                            },
+                            Focus::DeployFile => match key.code {
+                                KeyCode::Left | KeyCode::Up => app.deploy_files_up(),
+                                KeyCode::Right | KeyCode::Down => app.deploy_files_down(),
+                                KeyCode::Char(c) => {
+                                    // h/l for navigation, other chars for filtering
+                                    if c == 'h' || c == 'k' {
+                                        app.deploy_files_up();
+                                    } else if c == 'l' || c == 'j' {
+                                        app.deploy_files_down();
+                                    } else {
+                                        app.deploy_files_filter.push(c);
+                                        app.reset_deploy_files_cursor();
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    app.deploy_files_filter.pop();
+                                    app.reset_deploy_files_cursor();
+                                }
                                 _ => {}
                             },
                             Focus::Patterns => {

@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(name = "log-hound")]
-#[command(about = "Search AWS CloudWatch Log Insights from your terminal")]
+#[command(about = "Search logs from AWS CloudWatch or Kamal deployments")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -15,27 +15,47 @@ pub struct Cli {
     /// AWS region
     #[arg(long, global = true, env = "AWS_REGION")]
     pub region: Option<String>,
+
+    /// Log source to use
+    #[arg(long, global = true, default_value = "cloudwatch")]
+    pub source: LogSource,
+}
+
+#[derive(ValueEnum, Clone, Debug, Default, PartialEq)]
+pub enum LogSource {
+    /// AWS CloudWatch Log Insights
+    #[default]
+    Cloudwatch,
+    /// Kamal-deployed Docker containers via SSH
+    Kamal,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Search logs with a filter string
     #[command(after_help = "Examples:
+  # CloudWatch (default):
   log-hound search \"ERROR\" -g my-app/production
   log-hound search \"user_id=123\" -g api/logs,web/logs --last 2h
-  log-hound search \"timeout\" -g service/prod --limit 50 -o grouped
-  log-hound search \"ERROR\" \"user_id=123\" -g app/logs  # AND condition
-  log-hound search \"ERROR\" -g app/logs --exclude health-check
   log-hound search \"ERROR\" -p production  # Use preset
-  log-hound search \"ERROR\" -g app/logs -o json  # JSON output")]
+
+  # Kamal deployments:
+  log-hound search \"ERROR\" --source kamal -d config/deploy.yml
+  log-hound search \"timeout\" --source kamal -d config/deploy.saiens.yml --last 30m
+  log-hound search -p saiens \"ERROR\"  # Preset with kamal source
+  log-hound search --source kamal -d config/deploy.yml -f  # Follow/tail logs live")]
     Search {
         /// Search patterns to match in @message (multiple = AND condition)
         #[arg(required_unless_present = "preset")]
         patterns: Vec<String>,
 
-        /// Log groups to search (comma-separated for multiple)
+        /// Log groups to search (CloudWatch) - comma-separated for multiple
         #[arg(short, long, value_delimiter = ',')]
         groups: Vec<String>,
+
+        /// Kamal deploy.yml file path (for --source kamal)
+        #[arg(short = 'd', long = "deploy")]
+        deploy_file: Option<String>,
 
         /// Use a saved preset from config
         #[arg(short, long)]
@@ -64,6 +84,10 @@ pub enum Commands {
         /// Maximum number of results per log group
         #[arg(long, default_value = "100")]
         limit: i32,
+
+        /// Follow/tail logs in real-time (Kamal source only)
+        #[arg(short = 'f', long)]
+        follow: bool,
     },
 
     /// List available log groups

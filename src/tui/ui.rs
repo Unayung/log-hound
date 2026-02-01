@@ -7,7 +7,8 @@ use ratatui::{
 };
 use std::collections::HashMap;
 
-use super::app::{App, Focus, SearchState};
+use super::app::{App, Focus, SearchState, SourceMode};
+use std::path::Path;
 
 const LOG_GROUP_COLORS: &[Color] = &[
     Color::Cyan,
@@ -151,22 +152,26 @@ fn build_color_map(app: &App) -> HashMap<String, Color> {
 }
 
 pub fn render(f: &mut Frame, app: &App) {
-    let selection_height = if app.focus == Focus::Regions || app.focus == Focus::LogGroups {
+    let show_cloudwatch_panels = app.source_mode == SourceMode::CloudWatch;
+    let selection_height = if show_cloudwatch_panels && (app.focus == Focus::Regions || app.focus == Focus::LogGroups) {
         10
-    } else {
+    } else if show_cloudwatch_panels {
         3
+    } else {
+        0  // Hidden in Kamal mode
     };
-
-    let has_presets = !app.presets.is_empty();
 
     // Build constraints dynamically to avoid empty slots
     let mut constraints: Vec<Constraint> = Vec::new();
-    if has_presets {
-        constraints.push(Constraint::Length(3));            // Presets
+    constraints.push(Constraint::Length(3));                // Source selector
+    if app.source_mode == SourceMode::Kamal {
+        constraints.push(Constraint::Length(3));            // Deploy file (Kamal only)
     }
     constraints.push(Constraint::Length(3));                // Patterns input
     constraints.push(Constraint::Length(3));                // Exclude input
-    constraints.push(Constraint::Length(selection_height as u16)); // Regions + Log groups
+    if show_cloudwatch_panels {
+        constraints.push(Constraint::Length(selection_height as u16)); // Regions + Log groups
+    }
     constraints.push(Constraint::Length(3));                // Time range + Limit + Status
     constraints.push(Constraint::Min(6));                   // Results
     constraints.push(Constraint::Length(2));                // Help
@@ -179,8 +184,11 @@ pub fn render(f: &mut Frame, app: &App) {
 
     let mut chunk_idx = 0;
 
-    if has_presets {
-        render_presets(f, app, chunks[chunk_idx]);
+    render_source_selector(f, app, chunks[chunk_idx]);
+    chunk_idx += 1;
+
+    if app.source_mode == SourceMode::Kamal {
+        render_deploy_file_input(f, app, chunks[chunk_idx]);
         chunk_idx += 1;
     }
 
@@ -190,12 +198,14 @@ pub fn render(f: &mut Frame, app: &App) {
     render_exclude_input(f, app, chunks[chunk_idx]);
     chunk_idx += 1;
 
-    if app.focus == Focus::Regions || app.focus == Focus::LogGroups {
-        render_selection_section(f, app, chunks[chunk_idx]);
-    } else {
-        render_selection_collapsed(f, app, chunks[chunk_idx]);
+    if show_cloudwatch_panels {
+        if app.focus == Focus::Regions || app.focus == Focus::LogGroups {
+            render_selection_section(f, app, chunks[chunk_idx]);
+        } else {
+            render_selection_collapsed(f, app, chunks[chunk_idx]);
+        }
+        chunk_idx += 1;
     }
-    chunk_idx += 1;
 
     render_time_status_section(f, app, chunks[chunk_idx]);
     chunk_idx += 1;
@@ -211,45 +221,128 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 }
 
-fn render_presets(f: &mut Frame, app: &App, area: Rect) {
-    let style = if app.focus == Focus::Presets {
+fn render_source_selector(f: &mut Frame, app: &App, area: Rect) {
+    let style = if app.focus == Focus::Source {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default()
     };
 
     let block = Block::default()
-        .title(" Presets (Enter to apply) ")
+        .title(" Source (h/l or ←/→) ")
         .borders(Borders::ALL)
         .border_style(style);
 
-    if app.presets.is_empty() {
-        let paragraph = Paragraph::new("No presets configured")
-            .block(block)
-            .style(Style::default().fg(Color::Gray));
-        f.render_widget(paragraph, area);
-        return;
-    }
+    let cloudwatch_style = if app.source_mode == SourceMode::CloudWatch {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
 
-    let preset_text: String = app
-        .presets
-        .iter()
-        .enumerate()
-        .map(|(idx, p)| {
-            if idx == app.presets_cursor && app.focus == Focus::Presets {
-                format!("[{}]", p.name)
-            } else {
-                p.name.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("  ");
+    let kamal_style = if app.source_mode == SourceMode::Kamal {
+        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
 
-    let paragraph = Paragraph::new(preset_text)
-        .block(block)
-        .style(Style::default().fg(Color::Cyan));
+    let content = Line::from(vec![
+        Span::styled(
+            if app.source_mode == SourceMode::CloudWatch { "[CloudWatch]" } else { " CloudWatch " },
+            cloudwatch_style,
+        ),
+        Span::raw("  "),
+        Span::styled(
+            if app.source_mode == SourceMode::Kamal { "[Kamal]" } else { " Kamal " },
+            kamal_style,
+        ),
+    ]);
 
+    let paragraph = Paragraph::new(content).block(block);
     f.render_widget(paragraph, area);
+}
+
+fn render_deploy_file_input(f: &mut Frame, app: &App, area: Rect) {
+    let style = if app.focus == Focus::DeployFile {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+
+    let filtered_indices = app.filtered_deploy_files_indices();
+    let filter_info = if app.deploy_files_filter.is_empty() {
+        String::new()
+    } else {
+        format!(" [filter: {}]", app.deploy_files_filter)
+    };
+    let title = format!(" Deploy File ({}/{}){} ", filtered_indices.len(), app.deploy_files.len(), filter_info);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(style);
+
+    if app.deploy_files.is_empty() {
+        let paragraph = Paragraph::new("No deploy*.yml found in config/")
+            .block(block)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(paragraph, area);
+    } else if filtered_indices.is_empty() {
+        let msg = format!("No match: {}", app.deploy_files_filter);
+        let paragraph = Paragraph::new(msg)
+            .block(block)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(paragraph, area);
+    } else {
+        // Build display showing filtered files with selection indicator
+        let mut spans: Vec<Span> = Vec::new();
+        let mut first = true;
+
+        for &idx in &filtered_indices {
+            let file_path = &app.deploy_files[idx];
+
+            // Extract simplified name: deploy.production.yml -> production
+            let filename = Path::new(file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(file_path);
+
+            // Remove "deploy." prefix and ".yml"/".yaml" suffix
+            let display_name = filename
+                .strip_prefix("deploy.")
+                .unwrap_or(filename)
+                .trim_end_matches(".yml")
+                .trim_end_matches(".yaml");
+
+            // Handle edge case: deploy.yml becomes empty after stripping
+            let display_name = if display_name.is_empty() || display_name == "yml" {
+                "default"
+            } else {
+                display_name
+            };
+
+            let is_selected = idx == app.deploy_files_cursor;
+
+            if !first {
+                spans.push(Span::raw("  "));
+            }
+            first = false;
+
+            if is_selected {
+                spans.push(Span::styled(
+                    format!("[{}]", display_name),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!(" {} ", display_name),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+
+        let paragraph = Paragraph::new(Line::from(spans)).block(block);
+        f.render_widget(paragraph, area);
+    }
 }
 
 fn render_patterns_input(f: &mut Frame, app: &App, area: Rect) {
@@ -574,25 +667,41 @@ fn render_limit(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
-    let (status_text, status_color) = match &app.search_state {
-        SearchState::Idle => {
-            let selected = app.selected_log_groups_count();
-            if selected == 0 {
-                ("Select log groups".to_string(), Color::Gray)
-            } else {
-                (format!("Ready - {} groups", selected), Color::Green)
+    let (status_text, status_color) = if app.is_following {
+        (format!("● FOLLOWING ({}) - Esc to stop", app.results.len()), Color::LightRed)
+    } else {
+        match &app.search_state {
+            SearchState::Idle => {
+                let follow_indicator = if app.follow_mode { " [f]" } else { "" };
+                let selected = app.selected_log_groups_count();
+                if app.source_mode == super::app::SourceMode::Kamal {
+                    (format!("Ready{}", follow_indicator), Color::Green)
+                } else if selected == 0 {
+                    ("Select log groups".to_string(), Color::Gray)
+                } else {
+                    (format!("Ready - {} groups{}", selected, follow_indicator), Color::Green)
+                }
             }
-        }
-        SearchState::LoadingGroups => ("Loading...".to_string(), Color::Yellow),
-        SearchState::Searching => ("Searching...".to_string(), Color::Yellow),
-        SearchState::Complete(count) => (format!("Found {} results", count), Color::Green),
-        SearchState::Error(e) => {
-            let truncated = if e.len() > 35 {
-                format!("{}...", &e[..32])
-            } else {
-                e.clone()
-            };
-            (format!("Error: {}", truncated), Color::Red)
+            SearchState::LoadingGroups => ("Loading...".to_string(), Color::Yellow),
+            SearchState::Searching => {
+                if app.follow_mode {
+                    ("Starting follow...".to_string(), Color::Yellow)
+                } else {
+                    ("Searching...".to_string(), Color::Yellow)
+                }
+            }
+            SearchState::Complete(count) => {
+                let follow_indicator = if app.follow_mode { " [f]" } else { "" };
+                (format!("Found {} results{}", count, follow_indicator), Color::Green)
+            }
+            SearchState::Error(e) => {
+                let truncated = if e.len() > 35 {
+                    format!("{}...", &e[..32])
+                } else {
+                    e.clone()
+                };
+                (format!("Error: {}", truncated), Color::Red)
+            }
         }
     };
 
@@ -698,13 +807,13 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_help_bar(f: &mut Frame, app: &App, area: Rect) {
     let help_text = match app.focus {
-        Focus::Presets => Line::from(vec![
+        Focus::DeployFile => Line::from(vec![
             Span::styled("↑/↓", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Select  "),
-            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Apply  "),
             Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Next"),
+            Span::raw(" Next  "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Search"),
         ]),
         Focus::Regions | Focus::LogGroups => Line::from(vec![
             Span::styled("Space", Style::default().add_modifier(Modifier::BOLD)),
@@ -716,19 +825,34 @@ fn render_help_bar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Next"),
         ]),
-        Focus::Results => Line::from(vec![
-            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Scroll  "),
-            Span::styled("h/l", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Horiz  "),
-            Span::styled("F1/?", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Help  "),
-            Span::styled("Ctrl+C", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Quit"),
-        ]),
+        Focus::Results => {
+            if app.is_following {
+                Line::from(vec![
+                    Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD).fg(Color::LightRed)),
+                    Span::raw(" Stop  "),
+                    Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Scroll  "),
+                    Span::styled("Ctrl+C", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Quit"),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Scroll  "),
+                    Span::styled("h/l", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Horiz  "),
+                    Span::styled("f", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Follow  "),
+                    Span::styled("Ctrl+C", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Quit"),
+                ])
+            }
+        }
         _ => Line::from(vec![
             Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Next  "),
+            Span::styled("f", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Follow  "),
             Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Search  "),
             Span::styled("Ctrl+C", Style::default().add_modifier(Modifier::BOLD)),
@@ -746,7 +870,7 @@ fn render_help_bar(f: &mut Frame, app: &App, area: Rect) {
 fn render_help_overlay(f: &mut Frame) {
     let area = f.area();
     let popup_width = 60;
-    let popup_height = 16;
+    let popup_height = 15;
     let popup_area = Rect::new(
         (area.width.saturating_sub(popup_width)) / 2,
         (area.height.saturating_sub(popup_height)) / 2,
@@ -761,13 +885,11 @@ fn render_help_overlay(f: &mut Frame) {
         Line::from(""),
         Line::from(vec![Span::styled("Tab / Shift+Tab", Style::default().fg(Color::Cyan)), Span::raw("  Navigate sections")]),
         Line::from(vec![Span::styled("Enter", Style::default().fg(Color::Cyan)), Span::raw("            Execute search")]),
+        Line::from(vec![Span::styled("f", Style::default().fg(Color::Cyan)), Span::raw("                Toggle follow mode")]),
         Line::from(vec![Span::styled("Space", Style::default().fg(Color::Cyan)), Span::raw("            Toggle selection")]),
         Line::from(vec![Span::styled("↑/↓ or j/k", Style::default().fg(Color::Cyan)), Span::raw("       Navigate lists")]),
         Line::from(vec![Span::styled("←/→ or h/l", Style::default().fg(Color::Cyan)), Span::raw("       Adjust values / scroll")]),
-        Line::from(vec![Span::styled("Ctrl+A", Style::default().fg(Color::Cyan)), Span::raw("           Select all log groups")]),
-        Line::from(vec![Span::styled("Ctrl+D", Style::default().fg(Color::Cyan)), Span::raw("           Deselect all")]),
-        Line::from(vec![Span::styled("Ctrl+R", Style::default().fg(Color::Cyan)), Span::raw("           Refresh log groups")]),
-        Line::from(vec![Span::styled("Esc", Style::default().fg(Color::Cyan)), Span::raw("              Clear filter / back")]),
+        Line::from(vec![Span::styled("Esc", Style::default().fg(Color::Cyan)), Span::raw("              Stop follow / back")]),
         Line::from(vec![Span::styled("Ctrl+C", Style::default().fg(Color::Cyan)), Span::raw("           Quit")]),
         Line::from(""),
         Line::from(Span::styled("Press any key to close", Style::default().fg(Color::DarkGray))),

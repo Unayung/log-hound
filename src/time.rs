@@ -115,6 +115,19 @@ fn parse_duration(input: &str) -> Result<Duration> {
     Ok(Duration::seconds(total_seconds as i64))
 }
 
+/// Convert a duration string to Docker's --since format
+/// Docker accepts: "1h30m", "2h", "30m", etc.
+pub fn to_docker_since(duration_str: &str) -> Result<String> {
+    // Docker's --since format is very similar to our input format
+    // It accepts combinations like "1h30m" directly
+    // We just need to validate it parses correctly
+    let _duration = parse_duration(duration_str)?;
+
+    // Return the original string as Docker accepts similar formats
+    // Normalize to lowercase for consistency
+    Ok(duration_str.trim().to_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
