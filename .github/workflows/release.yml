@@ -25,9 +25,10 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: log-hound-macos-aarch64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: log-hound-windows-x86_64.exe
+          # Windows build disabled: openssh crate requires Unix (std::os::unix)
+          # - target: x86_64-pc-windows-msvc
+          #   os: windows-latest
+          #   name: log-hound-windows-x86_64.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -50,15 +51,10 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename binary (unix)
-        if: runner.os != 'Windows'
+      - name: Rename binary
         run: |
           cp target/${{ matrix.target }}/release/log-hound ${{ matrix.name }}
           strip ${{ matrix.name }} || true
-
-      - name: Rename binary (windows)
-        if: runner.os == 'Windows'
-        run: cp target/${{ matrix.target }}/release/log-hound.exe ${{ matrix.name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
