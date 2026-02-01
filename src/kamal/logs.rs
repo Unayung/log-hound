@@ -240,10 +240,18 @@ impl KamalSearcher {
 
     /// Find the running container ID for the service
     async fn find_container(&self, session: &Session) -> Result<String> {
+        // Build filter pattern: service-web-{destination} if destination exists
+        // Kamal names containers as: {service}-{role}-{destination}-{hash}
+        let filter_pattern = if let Some(dest) = &self.config.destination {
+            format!("{}-web-{}", self.config.service, dest)
+        } else {
+            format!("{}-web", self.config.service)
+        };
+
         // Find containers matching the service name pattern
         let cmd = format!(
             "docker ps --filter 'name={}' --format '{{{{.ID}}}}' | head -1",
-            self.config.service
+            filter_pattern
         );
 
         let output = session
@@ -264,9 +272,15 @@ impl KamalSearcher {
             .to_string();
 
         if container_id.is_empty() {
+            let service_desc = if let Some(dest) = &self.config.destination {
+                format!("{} (destination: {})", self.config.service, dest)
+            } else {
+                self.config.service.clone()
+            };
             return Err(anyhow!(
-                "No running container found for service: {}",
-                self.config.service
+                "No running container found for service: {} (filter: {})",
+                service_desc,
+                filter_pattern
             ));
         }
 

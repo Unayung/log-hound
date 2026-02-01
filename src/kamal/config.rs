@@ -9,6 +9,8 @@ pub struct KamalConfig {
     pub service: String,
     pub servers: Vec<String>,
     pub ssh_user: String,
+    /// Destination name extracted from deploy.{destination}.yml filename
+    pub destination: Option<String>,
 }
 
 /// Raw YAML structure for Kamal deploy files
@@ -26,8 +28,17 @@ struct KamalYaml {
 enum ServersConfig {
     /// Simple list: servers: ["host1", "host2"]
     Simple(Vec<String>),
-    /// Role-based: servers: { web: ["host1"], job: ["host2"] }
-    RoleBased(HashMap<String, Vec<String>>),
+    /// Kamal 2.x role-based: servers: { web: ["host1"], job: ["host2"] }
+    RoleBasedSimple(HashMap<String, Vec<String>>),
+    /// Kamal 1.x role-based: servers: { web: { hosts: ["host1"], ... }, job: { hosts: ["host2"], ... } }
+    RoleBasedWithOptions(HashMap<String, RoleConfig>),
+}
+
+/// Kamal 1.x role configuration with hosts and optional settings
+#[derive(Debug, Deserialize, Clone)]
+struct RoleConfig {
+    hosts: Vec<String>,
+    // Other fields like labels, cmd, options are ignored for our purposes
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -52,6 +63,16 @@ impl KamalConfig {
         let needs_base = filename != "deploy.yml"
             && filename.starts_with("deploy.")
             && filename.ends_with(".yml");
+
+        // Extract destination from filename: deploy.rhinoshield.yml -> rhinoshield
+        let destination = if needs_base {
+            filename
+                .strip_prefix("deploy.")
+                .and_then(|s| s.strip_suffix(".yml"))
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
 
         let merged = if needs_base {
             // Try to load base deploy.yml from same directory
@@ -78,11 +99,11 @@ impl KamalConfig {
             env_config
         };
 
-        Self::from_yaml(merged)
+        Self::from_yaml(merged, destination)
     }
 
     /// Convert parsed YAML to KamalConfig
-    fn from_yaml(raw: KamalYaml) -> Result<Self> {
+    fn from_yaml(raw: KamalYaml, destination: Option<String>) -> Result<Self> {
         let service = raw.service
             .ok_or_else(|| anyhow!("Missing 'service' in Kamal config"))?;
 
@@ -92,8 +113,8 @@ impl KamalConfig {
         // Extract all servers from the config
         let servers = match servers_config {
             ServersConfig::Simple(hosts) => hosts,
-            ServersConfig::RoleBased(roles) => {
-                // Flatten all roles into a single list, prioritizing 'web' role
+            ServersConfig::RoleBasedSimple(roles) => {
+                // Kamal 2.x: Flatten all roles into a single list, prioritizing 'web' role
                 let mut all_servers = Vec::new();
                 if let Some(web_servers) = roles.get("web") {
                     all_servers.extend(web_servers.clone());
@@ -105,7 +126,24 @@ impl KamalConfig {
                 }
                 all_servers
             }
+            ServersConfig::RoleBasedWithOptions(roles) => {
+                // Kamal 1.x: Extract hosts from role configs
+                let mut all_servers = Vec::new();
+                if let Some(web_config) = roles.get("web") {
+                    all_servers.extend(web_config.hosts.clone());
+                }
+                for (role, config) in roles {
+                    if role != "web" {
+                        all_servers.extend(config.hosts.clone());
+                    }
+                }
+                all_servers
+            }
         };
+
+        // Deduplicate servers (same host might appear in multiple roles)
+        let mut seen = std::collections::HashSet::new();
+        let servers: Vec<String> = servers.into_iter().filter(|s| seen.insert(s.clone())).collect();
 
         if servers.is_empty() {
             return Err(anyhow!("No servers found in Kamal config"));
@@ -121,6 +159,7 @@ impl KamalConfig {
             service,
             servers,
             ssh_user,
+            destination,
         })
     }
 
@@ -128,7 +167,7 @@ impl KamalConfig {
     pub fn parse(yaml: &str) -> Result<Self> {
         let raw: KamalYaml = serde_yaml::from_str(yaml)
             .context("Failed to parse Kamal YAML")?;
-        Self::from_yaml(raw)
+        Self::from_yaml(raw, None)
     }
 
     /// Get the container name pattern for docker logs
@@ -157,7 +196,7 @@ servers:
     }
 
     #[test]
-    fn test_parse_role_based_servers() {
+    fn test_parse_role_based_servers_kamal2() {
         let yaml = r#"
 service: my-app
 servers:
@@ -173,5 +212,29 @@ ssh:
         assert!(config.servers.contains(&"web1.example.com".to_string()));
         assert!(config.servers.contains(&"job1.example.com".to_string()));
         assert_eq!(config.ssh_user, "deploy");
+    }
+
+    #[test]
+    fn test_parse_role_based_servers_kamal1() {
+        // Kamal 1.x format with hosts under each role
+        let yaml = r#"
+service: foundation
+servers:
+  web:
+    hosts:
+      - 35.74.156.92
+    labels:
+      traefik.http.routers.foundation-web.rule: Host(`example.com`)
+  job:
+    hosts:
+      - 35.74.156.92
+    cmd: bundle exec sidekiq
+ssh:
+  user: apps
+"#;
+        let config = KamalConfig::parse(yaml).unwrap();
+        assert_eq!(config.service, "foundation");
+        assert!(config.servers.contains(&"35.74.156.92".to_string()));
+        assert_eq!(config.ssh_user, "apps");
     }
 }
