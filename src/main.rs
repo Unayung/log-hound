@@ -6,7 +6,7 @@ mod output;
 mod time;
 mod tui;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use aws::SearchParams;
 use clap::Parser;
 use cli::{Cli, Commands, ConfigAction, LogSource, OutputMode};
@@ -277,6 +277,7 @@ async fn run_cloudwatch_search(
 
     // Search all log groups concurrently
     let mut all_entries = Vec::new();
+    let mut failed = 0;
 
     match output_mode {
         OutputMode::Streaming => {
@@ -294,6 +295,7 @@ async fn run_cloudwatch_search(
                         }
                     }
                     Err(e) => {
+                        failed += 1;
                         eprintln!("{} {}: {}", "Error".red(), group, e);
                     }
                 }
@@ -309,15 +311,22 @@ async fn run_cloudwatch_search(
                 match result {
                     Ok(entries) => all_entries.extend(entries),
                     Err(e) => {
-                        if output_mode != OutputMode::Json {
-                            eprintln!("{} {}: {}", "Error".red(), group, e);
-                        }
+                        // stderr even for JSON output: stdout stays valid JSON
+                        failed += 1;
+                        eprintln!("{} {}: {}", "Error".red(), group, e);
                     }
                 }
             }
 
-            output::display_results(all_entries, &output_mode);
+            // All groups failed: "No matching logs found." would be a lie
+            if failed < groups.len() {
+                output::display_results(all_entries, &output_mode);
+            }
         }
+    }
+
+    if failed > 0 {
+        return Err(anyhow!("{} of {} log group(s) failed", failed, groups.len()));
     }
 
     Ok(())
