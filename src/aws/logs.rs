@@ -1,5 +1,6 @@
 use crate::aws::multi_region::{MultiRegionClientPool, RegionalLogGroup};
 use anyhow::{anyhow, Result};
+use aws_sdk_cloudwatchlogs::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_cloudwatchlogs::Client;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Serialize;
@@ -160,6 +161,43 @@ impl LogSearcher {
     }
 }
 
+/// The SDK's plain Display is just "service error"; show the AWS code and message
+/// instead (e.g. MalformedQueryException), or the full chain for non-service errors.
+fn sdk_error<E, R>(e: SdkError<E, R>) -> anyhow::Error
+where
+    E: ProvideErrorMetadata + std::error::Error + 'static,
+    R: std::fmt::Debug,
+{
+    match (e.code(), e.message()) {
+        (Some(code), Some(msg)) => anyhow!("{}: {}", code, msg),
+        _ => anyhow!("{}", DisplayErrorContext(e)),
+    }
+}
+
+/// Stop a running Insights query and return the error to report for it
+async fn stop_query(client: &Client, query_id: &str) -> anyhow::Error {
+    match client.stop_query().query_id(query_id).send().await {
+        Ok(_) => anyhow!("cancelled (query {} stopped)", query_id),
+        Err(e) => anyhow!("cancelled, but StopQuery failed for {}: {}", query_id, sdk_error(e)),
+    }
+}
+
+/// Escape `/` so a pattern can't end the `/regex/` literal early
+/// (e.g. "/api/v2/chat" would otherwise produce a malformed query).
+/// Slashes the user already escaped (`\/`) are left alone.
+fn escape_slashes(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut escaped = false;
+    for c in pattern.chars() {
+        if c == '/' && !escaped {
+            out.push('\\');
+        }
+        escaped = c == '\\' && !escaped;
+        out.push(c);
+    }
+    out
+}
+
 /// Build CloudWatch Insights query for message filtering
 /// Supports include patterns (AND) and exclude patterns (NOT)
 fn build_insights_query(patterns: &[String], exclude: &[String], limit: i32) -> String {
@@ -167,13 +205,13 @@ fn build_insights_query(patterns: &[String], exclude: &[String], limit: i32) -> 
 
     // Add include patterns (AND condition)
     for p in patterns {
-        let escaped = p.replace('\'', "\\'");
+        let escaped = escape_slashes(&p.replace('\'', "\\'"));
         filter_conditions.push(format!("@message like /{}/", escaped));
     }
 
     // Add exclude patterns (NOT condition)
     for p in exclude {
-        let escaped = p.replace('\'', "\\'");
+        let escaped = escape_slashes(&p.replace('\'', "\\'"));
         filter_conditions.push(format!("@message not like /{}/", escaped));
     }
 
@@ -321,21 +359,27 @@ impl MultiRegionSearcher {
             .end_time(end_epoch)
             .query_string(&query)
             .send()
-            .await?;
+            .await
+            .map_err(sdk_error)?;
 
         let query_id = start_response
             .query_id
             .ok_or_else(|| anyhow!("No query ID returned"))?;
 
-        // Poll for results
+        // Poll for results. On Ctrl-C, stop the query on AWS too: otherwise it keeps
+        // scanning (and billing) until it finishes or hits the 60-minute timeout.
+        // One pinned listener per query, so a Ctrl-C during a request isn't missed.
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
         let mut entries = Vec::new();
 
         loop {
-            let response = client
-                .get_query_results()
-                .query_id(&query_id)
-                .send()
-                .await?;
+            let response = tokio::select! {
+                r = client.get_query_results().query_id(&query_id).send() => {
+                    r.map_err(sdk_error)?
+                }
+                _ = &mut ctrl_c => return Err(stop_query(&client, &query_id).await),
+            };
 
             let status = response
                 .status
@@ -360,7 +404,10 @@ impl MultiRegionSearcher {
                     return Err(anyhow!("Query {}: {}", query_id, status));
                 }
                 _ => {
-                    sleep(Duration::from_millis(500)).await;
+                    tokio::select! {
+                        _ = sleep(Duration::from_millis(500)) => {}
+                        _ = &mut ctrl_c => return Err(stop_query(&client, &query_id).await),
+                    }
                 }
             }
         }
@@ -407,5 +454,23 @@ impl MultiRegionSearcher {
         }
 
         Ok(log_groups)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_escapes_slashes_in_patterns() {
+        let q = build_insights_query(&["/api/v2/chat".into()], &["a/b".into()], 10);
+        assert!(q.contains(r"@message like /\/api\/v2\/chat/"));
+        assert!(q.contains(r"@message not like /a\/b/"));
+    }
+
+    #[test]
+    fn already_escaped_slashes_are_kept() {
+        assert_eq!(escape_slashes(r"a\/b"), r"a\/b");
+        assert_eq!(escape_slashes(r"a\\/b"), r"a\\\/b");
     }
 }
