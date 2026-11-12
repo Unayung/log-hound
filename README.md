@@ -150,10 +150,10 @@ If the group is archived to S3 (CloudWatch → Firehose → S3, partitioned `yea
 max_scan_gb = 30
 athena_above_gb = 5
 
-[athena."pluto/production"]
+[athena."app/production"]
 region = "ap-east-2"
-workgroup = "pluto-logs"
-table = "pluto_logs.pluto_production"
+workgroup = "app-logs"
+table = "app_logs.app_production"
 ```
 
 Patterns are regexes in both backends (`regexp_like` on Athena). Athena prints the bytes it scanned; the workgroup's own per-query cap still applies.
