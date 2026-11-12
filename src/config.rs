@@ -30,6 +30,27 @@ pub struct Config {
     /// Saved presets for quick access
     #[serde(default)]
     pub presets: HashMap<String, Preset>,
+
+    /// Refuse Insights searches estimated to scan more than this (default 30 GB)
+    #[serde(default)]
+    pub max_scan_gb: Option<f64>,
+
+    /// Archived groups go to Athena when Insights would scan more than this (default 5 GB)
+    #[serde(default)]
+    pub athena_above_gb: Option<f64>,
+
+    /// Log group name (no region prefix) -> its S3 archive queryable with Athena
+    #[serde(default)]
+    pub athena: HashMap<String, AthenaTarget>,
+}
+
+/// Where a log group's archive lives in Athena
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AthenaTarget {
+    pub region: String,
+    pub workgroup: String,
+    /// "database.table"
+    pub table: String,
 }
 
 /// A saved preset configuration
@@ -122,6 +143,19 @@ default_time_range = "1h"
 
 # Default result limit
 default_limit = 100
+
+# Refuse Insights searches estimated to scan more than this many GB.
+# Insights bills every byte ingested in the time window, whatever the filter or limit.
+# max_scan_gb = 30
+
+# Log groups archived to S3: searched with Athena when the range is older than the
+# group's CloudWatch retention, Insights would scan more than athena_above_gb
+# (default 5), the total is over max_scan_gb, or with --athena
+# athena_above_gb = 5
+# [athena."app/production"]
+# region = "ap-east-2"
+# workgroup = "app-logs"
+# table = "app_logs.app_production"
 
 # Presets for quick access
 # Use with: log-hound search -p <preset_name> "ERROR"

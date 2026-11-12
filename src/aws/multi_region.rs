@@ -80,6 +80,22 @@ impl MultiRegionClientPool {
         }
     }
 
+    /// AWS config for a region (falls back to the default region), with the pool's profile
+    pub async fn load_config(&self, region: Option<&str>) -> aws_config::SdkConfig {
+        let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
+
+        if let Some(profile_name) = &self.profile {
+            config_loader = config_loader.profile_name(profile_name);
+        }
+
+        let effective_region = region.or(self.default_region.as_deref());
+        if let Some(region_name) = effective_region {
+            config_loader = config_loader.region(aws_config::Region::new(region_name.to_string()));
+        }
+
+        config_loader.load().await
+    }
+
     /// Get or create a client for the specified region
     pub async fn get_client(&self, region: Option<&str>) -> Result<Client> {
         let region_key = region
@@ -95,20 +111,7 @@ impl MultiRegionClientPool {
             }
         }
 
-        // Create new client
-        let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
-
-        if let Some(profile_name) = &self.profile {
-            config_loader = config_loader.profile_name(profile_name);
-        }
-
-        let effective_region = region.or(self.default_region.as_deref());
-        if let Some(region_name) = effective_region {
-            config_loader = config_loader.region(aws_config::Region::new(region_name.to_string()));
-        }
-
-        let config = config_loader.load().await;
-        let client = Client::new(&config);
+        let client = Client::new(&self.load_config(region).await);
 
         // Store for reuse
         {

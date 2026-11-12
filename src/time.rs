@@ -34,6 +34,17 @@ impl TimeRange {
     }
 }
 
+/// Oldest time a group with `retention_days` still holds, if `start` reaches past it.
+/// CloudWatch doesn't error on expired time, it just finds nothing there.
+pub fn retention_cutoff(
+    start: DateTime<Utc>,
+    now: DateTime<Utc>,
+    retention_days: i32,
+) -> Option<DateTime<Utc>> {
+    let cutoff = now - Duration::days(retention_days as i64);
+    (start < cutoff).then_some(cutoff)
+}
+
 /// Parse a datetime string into UTC DateTime
 fn parse_datetime(input: &str) -> Result<DateTime<Utc>> {
     // Try RFC3339 first
@@ -167,6 +178,16 @@ mod tests {
         assert_eq!(parse_duration("2H").unwrap(), Duration::hours(2));
         assert_eq!(parse_duration("30M").unwrap(), Duration::minutes(30));
         assert_eq!(parse_duration("1D").unwrap(), Duration::days(1));
+    }
+
+    #[test]
+    fn test_retention_cutoff() {
+        let now = Utc::now();
+        assert_eq!(retention_cutoff(now - Duration::days(29), now, 30), None);
+        assert_eq!(
+            retention_cutoff(now - Duration::days(45), now, 30),
+            Some(now - Duration::days(30))
+        );
     }
 
     #[test]

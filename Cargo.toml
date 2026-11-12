@@ -41,3 +41,5 @@ serde_yaml = "0.9"
 
 # SSH for Kamal source
 openssh = { version = "0.11", features = ["native-mux"] }
+aws-sdk-athena = "1"
+aws-sdk-cloudwatch = "1"

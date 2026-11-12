@@ -1,3 +1,4 @@
+mod athena;
 mod client;
 mod logs;
 mod multi_region;
