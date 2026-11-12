@@ -1,6 +1,7 @@
 mod aws;
 mod cli;
 mod config;
+mod cost;
 mod kamal;
 mod output;
 mod time;
@@ -394,15 +395,20 @@ async fn run_cloudwatch_search(
         .chain(via_athena.into_iter().map(|(g, _)| g).zip(athena_results));
 
     let mut all_entries = Vec::new();
+    let mut scans = Vec::new();
     for (group, result) in results {
         if output_mode == OutputMode::Streaming {
             println!("{} {}...", "Querying".dimmed(), group.cyan());
         }
         match result {
-            Ok(entries) if output_mode == OutputMode::Streaming => {
-                entries.iter().for_each(output::print_entry)
+            Ok((entries, scan)) => {
+                scans.push(scan);
+                if output_mode == OutputMode::Streaming {
+                    entries.iter().for_each(output::print_entry)
+                } else {
+                    all_entries.extend(entries)
+                }
             }
-            Ok(entries) => all_entries.extend(entries),
             Err(e) => {
                 // stderr even for JSON output: stdout stays valid JSON
                 failed += 1;
@@ -413,7 +419,11 @@ async fn run_cloudwatch_search(
 
     // All groups failed: "No matching logs found." would be a lie
     if output_mode != OutputMode::Streaming && failed < total {
-        output::display_results(all_entries, &output_mode);
+        output::display_results(all_entries, &output_mode, &scans);
+    }
+    // JSON carries it in the object; everyone else gets a line after the results
+    if output_mode != OutputMode::Json && !scans.is_empty() {
+        println!("\n{}", cost::summary(&scans).dimmed());
     }
 
     if failed > 0 {
@@ -540,7 +550,7 @@ async fn run_kamal_search(
                 }
             }
 
-            output::display_results(all_entries, &output_mode);
+            output::display_results(all_entries, &output_mode, &[]);
         }
     }
 

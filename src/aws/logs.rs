@@ -1,4 +1,5 @@
 use crate::aws::multi_region::{MultiRegionClientPool, RegionalLogGroup};
+use crate::cost::{Engine, Scan};
 use anyhow::{anyhow, Result};
 use aws_sdk_cloudwatchlogs::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_cloudwatchlogs::Client;
@@ -308,7 +309,7 @@ impl MultiRegionSearcher {
         params: &SearchParams,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-    ) -> Vec<Result<Vec<LogEntry>>> {
+    ) -> Vec<Result<(Vec<LogEntry>, Scan)>> {
         let regional_groups = RegionalLogGroup::parse_many(log_groups);
 
         let futures: Vec<_> = regional_groups
@@ -332,7 +333,7 @@ impl MultiRegionSearcher {
         params: SearchParams,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-    ) -> Result<Vec<LogEntry>> {
+    ) -> Result<(Vec<LogEntry>, Scan)> {
         let client = self
             .client_pool
             .get_client(regional_group.region.as_deref())
@@ -372,6 +373,7 @@ impl MultiRegionSearcher {
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         let mut entries = Vec::new();
+        let mut scanned_bytes = 0.0;
 
         loop {
             let response = tokio::select! {
@@ -388,6 +390,7 @@ impl MultiRegionSearcher {
 
             match status.as_str() {
                 "Complete" => {
+                    scanned_bytes = response.statistics.as_ref().map_or(0.0, |s| s.bytes_scanned());
                     if let Some(results) = response.results {
                         for result in results {
                             if let Some(mut entry) =
@@ -412,7 +415,9 @@ impl MultiRegionSearcher {
             }
         }
 
-        Ok(entries)
+        let region = client.config().region().map_or("", |r| r.as_ref());
+        let scan = Scan::new(&regional_group.log_group, Engine::Insights, region, scanned_bytes);
+        Ok((entries, scan))
     }
 
     /// Bytes ingested into a group during [start, end] (CloudWatch IncomingBytes), which
@@ -463,9 +468,11 @@ impl MultiRegionSearcher {
         params: &SearchParams,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
-    ) -> Result<Vec<LogEntry>> {
+    ) -> Result<(Vec<LogEntry>, Scan)> {
         let config = self.client_pool.load_config(Some(&target.region)).await;
-        crate::aws::athena::search(&config, group, target, params, start, end).await
+        let (entries, bytes) =
+            crate::aws::athena::search(&config, group, target, params, start, end).await?;
+        Ok((entries, Scan::new(group, Engine::Athena, &target.region, bytes)))
     }
 
     /// Retention of a log group in days; None = never expires (or group not found)

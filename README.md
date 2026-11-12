@@ -156,7 +156,9 @@ workgroup = "app-logs"
 table = "app_logs.app_production"
 ```
 
-Patterns are regexes in both backends (`regexp_like` on Athena). Athena prints the bytes it scanned; the workgroup's own per-query cap still applies.
+Patterns are regexes in both backends (`regexp_like` on Athena). The workgroup's own per-query cap still applies.
+
+Every search reports what it cost, from the bytes AWS says each query scanned times the list price (Athena's 10 MB minimum included; Glacier retrieval for old archive data is not): a `Cost: ~$0.0016 (app/production via Insights 0.31 GB)` line after the results, or `cost_usd` plus per-query `scans` in `-o json`.
 
 ### List Log Groups
 

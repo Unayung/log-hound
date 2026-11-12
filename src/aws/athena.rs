@@ -92,7 +92,7 @@ pub async fn search(
     params: &SearchParams,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-) -> Result<Vec<LogEntry>> {
+) -> Result<(Vec<LogEntry>, f64)> {
     let client = Client::new(config);
 
     let query = build_query(&target.table, params, start, end);
@@ -125,7 +125,7 @@ pub async fn search(
                 break execution
                     .and_then(|q| q.statistics())
                     .and_then(|s| s.data_scanned_in_bytes())
-                    .unwrap_or(0)
+                    .unwrap_or(0) as f64
             }
             Some(QueryExecutionState::Failed) | Some(QueryExecutionState::Cancelled) => {
                 // e.g. the workgroup's per-query scan cap: narrow the range
@@ -138,12 +138,6 @@ pub async fn search(
             },
         }
     };
-    eprintln!(
-        "{} via Athena {}: scanned {:.1} MB",
-        group,
-        target.table,
-        scanned as f64 / 1_048_576.0
-    );
 
     let mut entries = Vec::new();
     let mut token = None;
@@ -179,7 +173,7 @@ pub async fn search(
             break;
         }
     }
-    Ok(entries)
+    Ok((entries, scanned))
 }
 
 #[cfg(test)]

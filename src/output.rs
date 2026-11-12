@@ -1,23 +1,26 @@
 use crate::aws::LogEntry;
 use crate::cli::OutputMode;
+use crate::cost::{total_usd, Scan};
 use colored::Colorize;
 use serde::Serialize;
 
 /// JSON output wrapper for structured results
 #[derive(Serialize)]
-struct JsonOutput {
+struct JsonOutput<'a> {
     total: usize,
     results: Vec<LogEntry>,
+    /// What this search cost, from the bytes AWS reports each query scanned
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "<[Scan]>::is_empty")]
+    scans: &'a [Scan],
 }
 
 /// Format and display log entries based on the selected output mode
-pub fn display_results(entries: Vec<LogEntry>, mode: &OutputMode) {
+pub fn display_results(entries: Vec<LogEntry>, mode: &OutputMode, scans: &[Scan]) {
     if entries.is_empty() {
         if *mode == OutputMode::Json {
-            println!("{}", serde_json::to_string_pretty(&JsonOutput {
-                total: 0,
-                results: vec![],
-            }).unwrap_or_default());
+            display_json(entries, scans);
         } else {
             println!("{}", "No matching logs found.".yellow());
         }
@@ -27,7 +30,7 @@ pub fn display_results(entries: Vec<LogEntry>, mode: &OutputMode) {
     match mode {
         OutputMode::Interleaved => display_interleaved(entries),
         OutputMode::Grouped => display_grouped(entries),
-        OutputMode::Json => display_json(entries),
+        OutputMode::Json => display_json(entries, scans),
         OutputMode::Streaming => {
             // Streaming mode displays as results arrive (handled differently)
             // When called here, just display interleaved as fallback
@@ -80,13 +83,15 @@ fn display_grouped(entries: Vec<LogEntry>) {
     }
 }
 
-fn display_json(mut entries: Vec<LogEntry>) {
+fn display_json(mut entries: Vec<LogEntry>, scans: &[Scan]) {
     // Sort by timestamp for consistent output
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
     let output = JsonOutput {
         total: entries.len(),
         results: entries,
+        cost_usd: (!scans.is_empty()).then(|| total_usd(scans)),
+        scans,
     };
 
     match serde_json::to_string_pretty(&output) {
