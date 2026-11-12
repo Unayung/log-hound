@@ -1,6 +1,7 @@
 mod aws;
 mod cli;
 mod config;
+mod cost;
 mod kamal;
 mod output;
 mod time;
@@ -32,6 +33,8 @@ async fn main() -> Result<()> {
             output,
             limit,
             follow,
+            athena,
+            max_scan_gb,
         } => {
             // Resolve preset if specified
             let (resolved_groups, resolved_patterns, resolved_exclude, resolved_last, resolved_limit, resolved_deploy, resolved_source) =
@@ -96,6 +99,10 @@ async fn main() -> Result<()> {
                         end,
                         output,
                         resolved_limit,
+                        &config.athena,
+                        athena,
+                        max_scan_gb.or(config.max_scan_gb).unwrap_or(30.0),
+                        config.athena_above_gb.unwrap_or(5.0),
                     )
                     .await?;
                 }
@@ -209,6 +216,10 @@ async fn run_cloudwatch_search(
     end: Option<String>,
     output_mode: OutputMode,
     limit: i32,
+    athena_targets: &std::collections::HashMap<String, config::AthenaTarget>,
+    force_athena: bool,
+    max_scan_gb: f64,
+    athena_above_gb: f64,
 ) -> Result<()> {
     // Determine time range
     let time_range = if let Some(start_str) = start {
@@ -275,58 +286,148 @@ async fn run_cloudwatch_search(
         return Ok(());
     }
 
-    // Search all log groups concurrently
-    let mut all_entries = Vec::new();
+    let total = groups.len();
     let mut failed = 0;
+    let now = chrono::Utc::now();
+    let athena_for = |g: &str| athena_targets.get(&aws::RegionalLogGroup::parse(g).log_group).cloned();
 
-    match output_mode {
-        OutputMode::Streaming => {
-            // For streaming, search sequentially to show results as they come
-            let results = searcher
-                .search_log_groups(&groups, &params, time_range.start, time_range.end)
-                .await;
-
-            for (group, result) in groups.iter().zip(results) {
-                println!("{} {}...", "Querying".dimmed(), group.cyan());
-                match result {
-                    Ok(entries) => {
-                        for entry in entries {
-                            output::print_entry(&entry);
-                        }
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        eprintln!("{} {}: {}", "Error".red(), group, e);
-                    }
-                }
+    // Time older than a group's retention is gone from CloudWatch, and Insights just
+    // returns nothing for it: send it to the archive, or say so instead of a misleading
+    // "No matching logs found."
+    let retentions =
+        futures::future::join_all(groups.iter().map(|g| searcher.retention_days(g))).await;
+    let mut via_athena = Vec::new();
+    let mut via_insights = Vec::new(); // (group, start of what CloudWatch still has)
+    for (group, retention) in groups.into_iter().zip(retentions) {
+        // ponytail: lookup failure skips the check; the search reports access errors itself
+        let cutoff = match retention {
+            Ok(Some(days)) => time::retention_cutoff(time_range.start, now, days).map(|c| (c, days)),
+            _ => None,
+        };
+        if let Some(target) = athena_for(&group) {
+            if force_athena || cutoff.is_some() {
+                via_athena.push((group, target));
+                continue;
             }
         }
-        _ => {
-            // For interleaved/grouped/json, collect all results first
-            let results = searcher
-                .search_log_groups(&groups, &params, time_range.start, time_range.end)
-                .await;
+        let mut start = time_range.start;
+        if let Some((cutoff, days)) = cutoff {
+            let shown = cutoff.format("%Y-%m-%d %H:%M UTC");
+            if time_range.end <= cutoff {
+                failed += 1;
+                eprintln!(
+                    "{} {}: whole range is older than its {}-day retention (nothing before {}), \
+                     and no [athena] archive is configured for it.",
+                    "Error".red(), group, days, shown
+                );
+                continue;
+            }
+            eprintln!(
+                "{} {}: {}-day retention, nothing before {} is searched; results are partial.",
+                "Warning".yellow(), group, days, shown
+            );
+            start = cutoff;
+        }
+        via_insights.push((group, start));
+    }
 
-            for (group, result) in groups.iter().zip(results) {
-                match result {
-                    Ok(entries) => all_entries.extend(entries),
-                    Err(e) => {
-                        // stderr even for JSON output: stdout stays valid JSON
-                        failed += 1;
-                        eprintln!("{} {}: {}", "Error".red(), group, e);
-                    }
+    // Cost gate. Insights bills every byte ingested in the window, whatever the filter
+    // or --limit, so a month of a busy group costs the same for any pattern. Estimate
+    // first; over budget, archived groups go to Athena, and the rest is refused.
+    let estimates = futures::future::join_all(
+        via_insights
+            .iter()
+            .map(|(g, start)| searcher.estimate_scan_bytes(g, *start, time_range.end)),
+    )
+    .await;
+    let gb = |bytes: f64| bytes / 1e9;
+    let mut planned: Vec<(String, f64)> = Vec::new();
+    for ((group, _), estimate) in via_insights.into_iter().zip(estimates) {
+        match estimate {
+            Ok(bytes) => planned.push((group, bytes)),
+            Err(e) => {
+                // ponytail: fail open, so a missing cloudwatch:GetMetricStatistics permission doesn't block searching
+                eprintln!("{} {}: can't estimate scan size ({}), not counted", "Warning".yellow(), group, e);
+                planned.push((group, 0.0));
+            }
+        }
+    }
+    // Archived groups go to Athena once the scan is big enough to matter: it scans
+    // ~1/6 of what Insights does for the same window, at up to ~5 minutes of lag
+    let over_budget = gb(planned.iter().map(|(_, b)| b).sum()) > max_scan_gb;
+    planned.retain(|(g, bytes)| match athena_for(g) {
+        Some(target) if over_budget || gb(*bytes) > athena_above_gb => {
+            via_athena.push((g.clone(), target));
+            false
+        }
+        _ => true,
+    });
+    let scan_gb = gb(planned.iter().map(|(_, b)| b).sum());
+    if scan_gb > max_scan_gb {
+        let per_group = planned
+            .iter()
+            .map(|(g, b)| format!("{} {:.1} GB", g, gb(*b)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!(
+            "Refusing: Logs Insights would scan ~{:.1} GB ({}), over the {} GB limit. \
+             Insights bills the whole window regardless of patterns or --limit. \
+             Narrow --start/--end (pin the time from the DB or a known event), \
+             or pass --max-scan-gb {} if this is intended.",
+            scan_gb, per_group, max_scan_gb, scan_gb.ceil()
+        ));
+    }
+    let insights_groups: Vec<String> = planned.into_iter().map(|(g, _)| g).collect();
+    if !insights_groups.is_empty() {
+        eprintln!("{}", format!("Logs Insights will scan ~{:.1} GB", scan_gb).dimmed());
+    }
+
+    // Search everything concurrently
+    let (insights_results, athena_results) = tokio::join!(
+        searcher.search_log_groups(&insights_groups, &params, time_range.start, time_range.end),
+        futures::future::join_all(via_athena.iter().map(|(g, target)| {
+            searcher.search_athena(g, target, &params, time_range.start, time_range.end)
+        })),
+    );
+    let results = insights_groups
+        .into_iter()
+        .zip(insights_results)
+        .chain(via_athena.into_iter().map(|(g, _)| g).zip(athena_results));
+
+    let mut all_entries = Vec::new();
+    let mut scans = Vec::new();
+    for (group, result) in results {
+        if output_mode == OutputMode::Streaming {
+            println!("{} {}...", "Querying".dimmed(), group.cyan());
+        }
+        match result {
+            Ok((entries, scan)) => {
+                scans.push(scan);
+                if output_mode == OutputMode::Streaming {
+                    entries.iter().for_each(output::print_entry)
+                } else {
+                    all_entries.extend(entries)
                 }
             }
-
-            // All groups failed: "No matching logs found." would be a lie
-            if failed < groups.len() {
-                output::display_results(all_entries, &output_mode);
+            Err(e) => {
+                // stderr even for JSON output: stdout stays valid JSON
+                failed += 1;
+                eprintln!("{} {}: {}", "Error".red(), group, e);
             }
         }
     }
 
+    // All groups failed: "No matching logs found." would be a lie
+    if output_mode != OutputMode::Streaming && failed < total {
+        output::display_results(all_entries, &output_mode, &scans);
+    }
+    // JSON carries it in the object; everyone else gets a line after the results
+    if output_mode != OutputMode::Json && !scans.is_empty() {
+        println!("\n{}", cost::summary(&scans).dimmed());
+    }
+
     if failed > 0 {
-        return Err(anyhow!("{} of {} log group(s) failed", failed, groups.len()));
+        return Err(anyhow!("{} of {} log group(s) failed", failed, total));
     }
 
     Ok(())
@@ -449,7 +550,7 @@ async fn run_kamal_search(
                 }
             }
 
-            output::display_results(all_entries, &output_mode);
+            output::display_results(all_entries, &output_mode, &[]);
         }
     }
 

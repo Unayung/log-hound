@@ -138,6 +138,28 @@ groups = [
 ]
 ```
 
+### Cost Guard & Athena Archive
+
+Logs Insights bills every byte ingested in the time window, whatever the patterns or `--limit`: a month of a busy group costs the same for `ERROR` as for one request ID. Before querying, log-hound estimates the scan from the group's `IncomingBytes` metric and refuses above `max_scan_gb` (default 30), telling you to narrow the window or pass `--max-scan-gb N`.
+
+Time older than a group's CloudWatch retention is gone: Insights returns nothing for it without an error. log-hound warns when the range is partly past retention and fails when it is entirely past.
+
+If the group is archived to S3 (CloudWatch → Firehose → S3, partitioned `year/month/day/hour` in UTC), map it to its Athena table. The search then goes to Athena when the range is past retention, Insights would scan more than `athena_above_gb` (default 5) for it, the total would exceed `max_scan_gb`, or with `--athena`. For the same window Athena scans about 1/6 of what Insights does; the archive lags up to ~5 minutes, which is why short windows stay on Insights.
+
+```toml
+max_scan_gb = 30
+athena_above_gb = 5
+
+[athena."app/production"]
+region = "ap-east-2"
+workgroup = "app-logs"
+table = "app_logs.app_production"
+```
+
+Patterns are regexes in both backends (`regexp_like` on Athena). The workgroup's own per-query cap still applies.
+
+Every search reports what it cost, from the bytes AWS says each query scanned times the list price (Athena's 10 MB minimum included; Glacier retrieval for old archive data is not): a `Cost: ~$0.0016 (app/production via Insights 0.31 GB)` line after the results, or `cost_usd` plus per-query `scans` in `-o json`.
+
 ### List Log Groups
 
 ```bash

@@ -88,6 +88,14 @@ pub enum Commands {
         /// Follow/tail logs in real-time (Kamal source only)
         #[arg(short = 'f', long)]
         follow: bool,
+
+        /// Search the Athena archive for groups that have one configured
+        #[arg(long)]
+        athena: bool,
+
+        /// Allow an Insights scan up to this many GB (overrides max_scan_gb in config)
+        #[arg(long)]
+        max_scan_gb: Option<f64>,
     },
 
     /// List available log groups

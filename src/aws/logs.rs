@@ -1,4 +1,5 @@
 use crate::aws::multi_region::{MultiRegionClientPool, RegionalLogGroup};
+use crate::cost::{Engine, Scan};
 use anyhow::{anyhow, Result};
 use aws_sdk_cloudwatchlogs::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_cloudwatchlogs::Client;
@@ -163,7 +164,7 @@ impl LogSearcher {
 
 /// The SDK's plain Display is just "service error"; show the AWS code and message
 /// instead (e.g. MalformedQueryException), or the full chain for non-service errors.
-fn sdk_error<E, R>(e: SdkError<E, R>) -> anyhow::Error
+pub(crate) fn sdk_error<E, R>(e: SdkError<E, R>) -> anyhow::Error
 where
     E: ProvideErrorMetadata + std::error::Error + 'static,
     R: std::fmt::Debug,
@@ -308,7 +309,7 @@ impl MultiRegionSearcher {
         params: &SearchParams,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-    ) -> Vec<Result<Vec<LogEntry>>> {
+    ) -> Vec<Result<(Vec<LogEntry>, Scan)>> {
         let regional_groups = RegionalLogGroup::parse_many(log_groups);
 
         let futures: Vec<_> = regional_groups
@@ -332,7 +333,7 @@ impl MultiRegionSearcher {
         params: SearchParams,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
-    ) -> Result<Vec<LogEntry>> {
+    ) -> Result<(Vec<LogEntry>, Scan)> {
         let client = self
             .client_pool
             .get_client(regional_group.region.as_deref())
@@ -372,6 +373,7 @@ impl MultiRegionSearcher {
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         let mut entries = Vec::new();
+        let mut scanned_bytes = 0.0;
 
         loop {
             let response = tokio::select! {
@@ -388,6 +390,7 @@ impl MultiRegionSearcher {
 
             match status.as_str() {
                 "Complete" => {
+                    scanned_bytes = response.statistics.as_ref().map_or(0.0, |s| s.bytes_scanned());
                     if let Some(results) = response.results {
                         for result in results {
                             if let Some(mut entry) =
@@ -412,7 +415,82 @@ impl MultiRegionSearcher {
             }
         }
 
-        Ok(entries)
+        let region = client.config().region().map_or("", |r| r.as_ref());
+        let scan = Scan::new(&regional_group.log_group, Engine::Insights, region, scanned_bytes);
+        Ok((entries, scan))
+    }
+
+    /// Bytes ingested into a group during [start, end] (CloudWatch IncomingBytes), which
+    /// is what an Insights query over that window scans, whatever its filters or limit.
+    pub async fn estimate_scan_bytes(
+        &self,
+        group: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<f64> {
+        let rg = RegionalLogGroup::parse(group);
+        let client =
+            aws_sdk_cloudwatch::Client::new(&self.client_pool.load_config(rg.region.as_deref()).await);
+        // GetMetricStatistics returns at most 1440 datapoints per call
+        let window = end - start;
+        let period = if window <= chrono::Duration::days(1) {
+            300
+        } else if window <= chrono::Duration::days(60) {
+            3600
+        } else {
+            86400
+        };
+        let response = client
+            .get_metric_statistics()
+            .namespace("AWS/Logs")
+            .metric_name("IncomingBytes")
+            .dimensions(
+                aws_sdk_cloudwatch::types::Dimension::builder()
+                    .name("LogGroupName")
+                    .value(&rg.log_group)
+                    .build(),
+            )
+            .start_time(aws_sdk_cloudwatch::primitives::DateTime::from_secs(start.timestamp()))
+            .end_time(aws_sdk_cloudwatch::primitives::DateTime::from_secs(end.timestamp()))
+            .period(period)
+            .statistics(aws_sdk_cloudwatch::types::Statistic::Sum)
+            .send()
+            .await
+            .map_err(sdk_error)?;
+        Ok(response.datapoints().iter().filter_map(|d| d.sum()).sum())
+    }
+
+    /// Search a group's S3 archive with Athena
+    pub async fn search_athena(
+        &self,
+        group: &str,
+        target: &crate::config::AthenaTarget,
+        params: &SearchParams,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<(Vec<LogEntry>, Scan)> {
+        let config = self.client_pool.load_config(Some(&target.region)).await;
+        let (entries, bytes) =
+            crate::aws::athena::search(&config, group, target, params, start, end).await?;
+        Ok((entries, Scan::new(group, Engine::Athena, &target.region, bytes)))
+    }
+
+    /// Retention of a log group in days; None = never expires (or group not found)
+    pub async fn retention_days(&self, group: &str) -> Result<Option<i32>> {
+        let rg = RegionalLogGroup::parse(group);
+        let client = self.client_pool.get_client(rg.region.as_deref()).await?;
+        // Results are sorted by name, so the exact match comes first on the first page
+        let response = client
+            .describe_log_groups()
+            .log_group_name_prefix(&rg.log_group)
+            .send()
+            .await
+            .map_err(sdk_error)?;
+        Ok(response
+            .log_groups()
+            .iter()
+            .find(|g| g.log_group_name() == Some(rg.log_group.as_str()))
+            .and_then(|g| g.retention_in_days()))
     }
 
     /// List log groups from a specific region

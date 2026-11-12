@@ -662,7 +662,7 @@ async fn run_app(
                         let results = searcher.search_log_groups(&groups, &params, tr.start, tr.end).await;
 
                         for result in results {
-                            if let Ok(entries) = result {
+                            if let Ok((entries, _)) = result {
                                 for entry in entries {
                                     // Avoid duplicates by checking timestamp
                                     if !app.results.iter().take(100).any(|e| e.timestamp == entry.timestamp && e.message == entry.message) {
@@ -755,7 +755,7 @@ async fn run_app(
 
                                                 for result in results {
                                                     match result {
-                                                        Ok(entries) => all_entries.extend(entries),
+                                                        Ok((entries, _)) => all_entries.extend(entries),
                                                         Err(e) => errors.push(e.to_string()),
                                                     }
                                                 }
